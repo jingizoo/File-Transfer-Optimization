@@ -44,7 +44,11 @@ fast-xfer /path/to/file.txt 10.0.0.15:/data/replica/ --user myuser
 
 ### Large text file (600GB+)
 ```bash
-fast-xfer /data/bigfile.txt user@host:/data/ --strategy compress
+# Using pigz (fastest, default)
+fast-xfer /data/bigfile.txt user@host:/data/ --strategy compress --compressor pigz
+
+# Using zstd (better compression, slower)
+fast-xfer /data/bigfile.txt user@host:/data/ --strategy compress --compressor zstd
 ```
 
 ### Very large binary file on fast link

@@ -6,7 +6,7 @@
 
 - **Auto strategy**: Intelligently chooses compression when beneficial
 - **Direct transfer**: Standard rsync with optimized SSH settings
-- **Compression**: `zstd` compress → rsync → remote uncompress (best for huge text files)
+- **Compression**: Multiple algorithms supported (`pigz`/`gzip`/`zstd`) → rsync → remote uncompress (best for huge text files)
 - **Chunked parallel**: Split into parts, transfer in parallel, reassemble remotely (saturate 10G/25G/40G links)
 - **Optimized SSH**: Fast ciphers, connection multiplexing, throughput tuning
 - **Progress tracking**: Real-time transfer progress
@@ -64,7 +64,7 @@ bash install.sh
 - Test with: `ssh user@host true` (should work without password)
 
 **Optional (for compression strategies):**
-- `zstd` (on source, and on target for remote transfers)
+- `pigz` (parallel gzip, recommended - fastest) OR `gzip` OR `zstd` (on source, and on target for remote transfers)
 
 **Optional (for chunked strategy):**
 - `split` command on source
@@ -88,8 +88,13 @@ fast-xfer /mnt/disk1/bigfile.txt /mnt/disk2/replica/
 ### 2. Force compression (best for huge text files)
 
 ```bash
+# Using pigz (fastest, default)
 fast-xfer /data/bigfile.txt 10.0.0.15:/data/replica/ \
-  --strategy compress --zstd-level 3
+  --strategy compress --compressor pigz --compression-level 6
+
+# Using zstd (better compression ratio)
+fast-xfer /data/bigfile.txt 10.0.0.15:/data/replica/ \
+  --strategy compress --compressor zstd --compression-level 3
 ```
 
 ### 3. Fast initial transfer (throughput-first, weak resume)
@@ -144,7 +149,10 @@ fast-xfer /data/critical.dat 10.0.0.15:/data/replica/ \
 
 ### Compression Options
 
-- `--zstd-level LEVEL`: zstd compression level (1=fast, 3=default, higher=better compression)
+- `--compressor {pigz,zstd,gzip}`: Compression algorithm (default: `pigz` - fastest parallel gzip)
+- `--compression-level LEVEL`: Compression level (1=fast, 6=default for pigz/gzip, 3=default for zstd)
+- `--compression-threads N`: Threads for compression (0=auto, pigz only)
+- `--zstd-level LEVEL`: [DEPRECATED] Use `--compression-level` instead
 - `--auto-sample-mib SIZE`: Auto mode sample size in MiB (default: 256)
 - `--auto-threshold RATIO`: Auto mode compression threshold (default: 0.85)
 
@@ -211,7 +219,11 @@ Best for:
 ### For Constrained Bandwidth
 
 ```bash
-fast-xfer file.txt user@host:/path/ --strategy compress --zstd-level 3
+# Using pigz (faster compression)
+fast-xfer file.txt user@host:/path/ --strategy compress --compressor pigz --compression-level 6
+
+# Using zstd (better compression ratio, slower)
+fast-xfer file.txt user@host:/path/ --strategy compress --compressor zstd --compression-level 3
 ```
 
 ### For High-Speed Links
@@ -303,10 +315,21 @@ fast-xfer file.txt user@host:/absolute/path
 fast-xfer file.txt /absolute/path
 ```
 
-### "requires zstd installed"
+### "requires [compressor] installed"
 
-Install zstd:
+Install compression tools:
 ```bash
+# Install pigz (recommended - fastest)
+# Debian/Ubuntu
+sudo apt-get install pigz
+
+# RHEL/CentOS
+sudo yum install pigz
+
+# macOS
+brew install pigz
+
+# Or install zstd (better compression)
 # Debian/Ubuntu
 sudo apt-get install zstd
 
@@ -315,6 +338,8 @@ sudo yum install zstd
 
 # macOS
 brew install zstd
+
+# gzip is usually pre-installed on most systems
 ```
 
 ### Connection Timeout

@@ -155,20 +155,57 @@ def remote_mkdir_p(user: str, host: str, connect_timeout: int, cipher: str, cont
     run_checked(cmd)
 
 
-def estimate_zstd_ratio(src: Path, level: int, sample_bytes: int) -> Optional[Tuple[float, int, int]]:
+def get_compressor_cmd(compressor: str) -> Optional[tuple[str, str, str]]:
+    """
+    Returns (compress_cmd, decompress_cmd, extension) for the given compressor.
+    Returns None if compressor is not available.
+    """
+    if compressor == "zstd":
+        if which("zstd"):
+            return ("zstd", "zstd", ".zst")
+        return None
+    elif compressor == "pigz":
+        if which("pigz"):
+            return ("pigz", "pigz", ".gz")
+        # Fallback to gzip if pigz not available
+        if which("gzip"):
+            return ("gzip", "gunzip", ".gz")
+        return None
+    elif compressor == "gzip":
+        if which("gzip"):
+            return ("gzip", "gunzip", ".gz")
+        return None
+    return None
+
+
+def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_bytes: int) -> Optional[Tuple[float, int, int]]:
     """
     Return (ratio, in_bytes, out_bytes) for a sample.
     ratio = out/in (lower is better).
-    Uses external `zstd` if present.
+    Supports zstd, pigz, gzip.
     """
-    if which("zstd") is None:
+    comp_info = get_compressor_cmd(compressor)
+    if not comp_info:
         return None
-
+    
+    comp_cmd, _, _ = comp_info
     in_bytes = 0
     out_bytes = 0
 
+    # Build compression command based on algorithm
+    if compressor == "zstd":
+        cmd = [comp_cmd, f"-{level}", "-T0", "-c", "--no-progress"]
+    elif compressor in ("pigz", "gzip"):
+        # pigz uses -p for threads, gzip doesn't support threads
+        if comp_cmd == "pigz":
+            cmd = [comp_cmd, f"-{level}", "-p", "0", "-c"]
+        else:
+            cmd = [comp_cmd, f"-{level}", "-c"]
+    else:
+        return None
+
     p = subprocess.Popen(
-        ["zstd", f"-{level}", "-T0", "-c", "--no-progress"],
+        cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -286,31 +323,61 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
 
 
 def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
-    if which("zstd") is None:
-        raise RuntimeError("Strategy 'compress' requires zstd installed (command: zstd).")
+    compressor = args.compressor
+    comp_info = get_compressor_cmd(compressor)
+    if not comp_info:
+        raise RuntimeError(f"Strategy 'compress' requires {compressor} installed (command: {compressor}).")
+    
+    comp_cmd, decomp_cmd, ext = comp_info
     
     if not is_local:
         assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
-        if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
-            raise RuntimeError("Strategy 'compress' requires zstd installed on TARGET as well (command: zstd).")
+        # Check if remote has the decompressor
+        if compressor == "zstd":
+            remote_cmd_check = "zstd"
+        elif compressor in ("pigz", "gzip"):
+            remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+        else:
+            remote_cmd_check = decomp_cmd
+        
+        if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+            raise RuntimeError(f"Strategy 'compress' requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
 
     src = Path(args.source).resolve()
     workdir = Path(args.workdir).resolve() if args.workdir else src.parent
     workdir.mkdir(parents=True, exist_ok=True)
 
-    zst_local = workdir / (src.name + ".zst")
-    zst_dest = dest_file + ".zst"
+    comp_local = workdir / (src.name + ext)
+    comp_dest = dest_file + ext
 
-    eprint(f"[compress] Compressing {src.name} with zstd level {args.zstd_level}...")
-    run_stream(["zstd", f"-{args.zstd_level}", "-T0", "--no-progress", "-o", str(zst_local), str(src)])
+    # Build compression command
+    comp_level = args.compression_level
+    eprint(f"[compress] Compressing {src.name} with {compressor} level {comp_level}...")
+    
+    if compressor == "zstd":
+        cmd = [comp_cmd, f"-{comp_level}", "-T0", "--no-progress", "-o", str(comp_local), str(src)]
+        run_stream(cmd)
+    elif compressor == "pigz":
+        threads = args.compression_threads if hasattr(args, 'compression_threads') else 0
+        cmd = [comp_cmd, f"-{comp_level}", "-p", str(threads), str(src)]
+        # pigz doesn't support -o, so we redirect stdout
+        with open(comp_local, "wb") as out:
+            subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
+    elif compressor == "gzip":
+        cmd = [comp_cmd, f"-{comp_level}", "-c", str(src)]
+        # gzip -c outputs to stdout
+        with open(comp_local, "wb") as out:
+            subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
+    else:
+        raise RuntimeError(f"Unknown compressor: {compressor}")
 
     eprint(f"[compress] Transferring compressed file...")
     if is_local:
-        dest = zst_dest
+        dest = comp_dest
     else:
-        dest = f"{user}@{host}:{zst_dest}"
+        dest = f"{user}@{host}:{comp_dest}"
     cmd = build_rsync_cmd(
-        str(zst_local),
+        str(comp_local),
         dest,
         ssh_e,
         append_only=False,
@@ -324,31 +391,40 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
     eprint(f"[compress] Decompressing on destination...")
     if is_local:
         # Local decompression
-        if which("unzstd"):
-            run_checked(["unzstd", "-T0", "-f", "--rm", str(zst_dest)])
-        else:
-            run_checked(["zstd", "-d", "-T0", "-f", str(zst_dest)])
-            try:
-                Path(zst_dest).unlink()
-            except FileNotFoundError:
-                pass
+        if compressor == "zstd":
+            if which("unzstd"):
+                run_checked(["unzstd", "-T0", "-f", "--rm", str(comp_dest)])
+            else:
+                run_checked([decomp_cmd, "-d", "-T0", "-f", str(comp_dest)])
+                try:
+                    Path(comp_dest).unlink()
+                except FileNotFoundError:
+                    pass
+        elif compressor in ("pigz", "gzip"):
+            run_checked([decomp_cmd, "-f", str(comp_dest)])
     else:
         # Remote decompression
-        remote_cmd = f"""
+        if compressor == "zstd":
+            remote_cmd = f"""
 set -euo pipefail
 if command -v unzstd >/dev/null 2>&1; then
-  unzstd -T0 -f --rm {shlex.quote(zst_dest)}
+  unzstd -T0 -f --rm {shlex.quote(comp_dest)}
 else
-  zstd -d -T0 -f {shlex.quote(zst_dest)}
-  rm -f {shlex.quote(zst_dest)}
+  zstd -d -T0 -f {shlex.quote(comp_dest)}
+  rm -f {shlex.quote(comp_dest)}
 fi
+"""
+        else:  # pigz/gzip
+            remote_cmd = f"""
+set -euo pipefail
+gunzip -f {shlex.quote(comp_dest)} || gzip -d -f {shlex.quote(comp_dest)}
 """
         run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
 
     if not args.keep_local_artifact:
         try:
-            zst_local.unlink()
-            eprint(f"[compress] Cleaned up local artifact: {zst_local}")
+            comp_local.unlink()
+            eprint(f"[compress] Cleaned up local artifact: {comp_local}")
         except FileNotFoundError:
             pass
 
@@ -376,22 +452,36 @@ def split_file(src: Path, part_prefix: Path, chunk_size: str) -> list[Path]:
     return parts
 
 
-def compress_parts(parts: list[Path], level: int, parallel: int, keep_parts: bool) -> list[Path]:
-    if which("zstd") is None:
-        raise RuntimeError("Chunk compression requires zstd installed on SOURCE.")
+def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int, keep_parts: bool) -> list[Path]:
+    comp_info = get_compressor_cmd(compressor)
+    if not comp_info:
+        raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
+    
+    comp_cmd, _, ext = comp_info
     out: list[Path] = []
 
-    eprint(f"[chunked] Compressing {len(parts)} parts with zstd level {level} (parallel={parallel})...")
+    eprint(f"[chunked] Compressing {len(parts)} parts with {compressor} level {level} (parallel={parallel})...")
 
     def do_one(p: Path) -> Path:
-        zst = Path(str(p) + ".zst")
-        run_checked(["zstd", f"-{level}", "-T1", "--no-progress", "-o", str(zst), str(p)])
+        comp_file = Path(str(p) + ext)
+        
+        if compressor == "zstd":
+            run_checked([comp_cmd, f"-{level}", "-T1", "--no-progress", "-o", str(comp_file), str(p)])
+        elif compressor == "pigz":
+            cmd = [comp_cmd, f"-{level}", "-p", "1", "-c", str(p)]
+            with open(comp_file, "wb") as out:
+                subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
+        elif compressor == "gzip":
+            cmd = [comp_cmd, f"-{level}", "-c", str(p)]
+            with open(comp_file, "wb") as out:
+                subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
+        
         if not keep_parts:
             try:
                 p.unlink()
             except FileNotFoundError:
                 pass
-        return zst
+        return comp_file
 
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
         futs = [ex.submit(do_one, p) for p in parts]
@@ -462,13 +552,27 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
 
     parts_to_send: list[Path] = parts
     if args.compress_chunks:
+        compressor = args.compressor
+        comp_info = get_compressor_cmd(compressor)
+        if not comp_info:
+            raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
+        
+        _, decomp_cmd, ext = comp_info
+        
         if not is_local:
             assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
-            if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
-                raise RuntimeError("Chunk compression requires zstd installed on TARGET as well (command: zstd).")
-        if is_local and which("zstd") is None:
-            raise RuntimeError("Chunk compression requires zstd installed (command: zstd).")
-        parts_to_send = compress_parts(parts, args.zstd_level, args.parallel, keep_parts=args.keep_local_parts)
+            # Check for decompressor on remote
+            if compressor == "zstd":
+                remote_cmd_check = "zstd"
+            elif compressor in ("pigz", "gzip"):
+                remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+            else:
+                remote_cmd_check = decomp_cmd
+            
+            if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+        
+        parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts)
 
     stage_dir = f"{dest_dir.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
     if is_local:
@@ -483,14 +587,27 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
     stage_q = shlex.quote(stage_dir)
     dest_q = shlex.quote(dest_file)
     if args.compress_chunks:
+        compressor = args.compressor
+        _, decomp_cmd, ext = get_compressor_cmd(compressor) or (None, None, None)
+        
+        if compressor == "zstd":
+            decomp_cmd_str = "zstd -d -c"
+            pattern = "part.*.zst"
+        elif compressor in ("pigz", "gzip"):
+            decomp_cmd_str = "gunzip -c || gzip -d -c"
+            pattern = "part.*.gz"
+        else:
+            decomp_cmd_str = f"{decomp_cmd} -d -c"
+            pattern = f"part.*{ext}"
+        
         assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
 tmp="${{dest}}.incomplete.$$"
 : > "$tmp"
-for f in $(ls -1 part.*.zst | sort); do
-  zstd -d -c "$f" >> "$tmp"
+for f in $(ls -1 {pattern} | sort); do
+  {decomp_cmd_str} "$f" >> "$tmp"
   rm -f "$f"
 done
 mv -f "$tmp" "$dest"
@@ -572,18 +689,29 @@ def main() -> int:
     p.add_argument("--rsync-timeout", type=int, default=0, help="rsync I/O timeout (0 = disabled)")
     p.add_argument("--workdir", default=None, help="Working directory for artifacts/parts (default: alongside source, or temp for chunked)")
     p.add_argument("--cleanup-workdir", action="store_true", help="If --workdir is used with chunked, remove temp subdir after success")
-    p.add_argument("--keep-local-artifact", action="store_true", help="Keep local .zst artifact for compress strategy")
+    p.add_argument("--compressor", choices=["zstd", "pigz", "gzip"], default="pigz", help="Compression algorithm (pigz=fast parallel gzip, zstd=better ratio, gzip=fallback)")
+    p.add_argument("--compression-level", type=int, default=6, help="Compression level (1=fast, 6=default for pigz/gzip, 3=default for zstd)")
+    p.add_argument("--compression-threads", type=int, default=0, help="Threads for compression (0=auto, pigz only)")
+    p.add_argument("--keep-local-artifact", action="store_true", help="Keep local compressed artifact for compress strategy")
     p.add_argument("--chunk-size", default="20G", help="Chunk size for chunked strategy (e.g., 4G, 20G, 500M)")
     p.add_argument("--parallel", type=int, default=1, help="Parallel transfers for chunked strategy")
-    p.add_argument("--compress-chunks", action="store_true", help="In chunked mode, zstd-compress each chunk before transfer")
+    p.add_argument("--compress-chunks", action="store_true", help="In chunked mode, compress each chunk before transfer")
     p.add_argument("--keep-local-parts", action="store_true", help="Keep uncompressed local parts after compressing chunks")
     p.add_argument("--cleanup-local-parts", action="store_true", help="Delete local parts after successful chunked transfer")
-    p.add_argument("--zstd-level", type=int, default=3, help="zstd compression level (1=fast, 3=default)")
+    p.add_argument("--zstd-level", type=int, default=3, help="[DEPRECATED] Use --compression-level instead. zstd compression level (1=fast, 3=default)")
     p.add_argument("--auto-sample-mib", type=int, default=256, help="Auto mode: sample size (MiB) to estimate compressibility")
-    p.add_argument("--auto-threshold", type=float, default=0.85, help="Auto mode: choose compress if zstd(out/in) <= threshold")
+    p.add_argument("--auto-threshold", type=float, default=0.85, help="Auto mode: choose compress if compression(out/in) <= threshold")
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
 
     args = p.parse_args()
+
+    # Handle deprecated --zstd-level, map to compression-level if set
+    # If user explicitly set --zstd-level and didn't set --compression-level, use zstd-level
+    if hasattr(args, 'zstd_level'):
+        # Check if compression_level is still at default (6) and zstd_level was explicitly set
+        # We can't detect if it was explicitly set, so we'll use it if compressor is zstd
+        if args.compressor == "zstd" and args.compression_level == 6:
+            args.compression_level = args.zstd_level
 
     src = args.source.resolve()
     if not src.exists() or not src.is_file():
@@ -622,14 +750,18 @@ def main() -> int:
         if args.append_only:
             strategy = "direct"
         else:
+            # Check if compressor is available
+            compressor = args.compressor
+            comp_info = get_compressor_cmd(compressor)
+            
             if is_local:
-                # For local, just check if zstd is available
-                if which("zstd"):
+                # For local, check if compressor is available
+                if comp_info:
                     sample_bytes = args.auto_sample_mib * 1024**2
-                    est = estimate_zstd_ratio(src, args.zstd_level, sample_bytes)
+                    est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes)
                     if est:
                         ratio, in_b, out_b = est
-                        eprint(f"[auto] zstd sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
+                        eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
                         if ratio <= args.auto_threshold:
                             strategy = "compress"
                         else:
@@ -640,14 +772,26 @@ def main() -> int:
                     strategy = "direct"
             else:
                 assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
-                if which("zstd") and remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
-                    sample_bytes = args.auto_sample_mib * 1024**2
-                    est = estimate_zstd_ratio(src, args.zstd_level, sample_bytes)
-                    if est:
-                        ratio, in_b, out_b = est
-                        eprint(f"[auto] zstd sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
-                        if ratio <= args.auto_threshold:
-                            strategy = "compress"
+                if comp_info:
+                    # Check if remote has decompressor
+                    _, decomp_cmd, _ = comp_info
+                    if compressor == "zstd":
+                        remote_cmd_check = "zstd"
+                    elif compressor in ("pigz", "gzip"):
+                        remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+                    else:
+                        remote_cmd_check = decomp_cmd
+                    
+                    if remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                        sample_bytes = args.auto_sample_mib * 1024**2
+                        est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes)
+                        if est:
+                            ratio, in_b, out_b = est
+                            eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
+                            if ratio <= args.auto_threshold:
+                                strategy = "compress"
+                            else:
+                                strategy = "direct"
                         else:
                             strategy = "direct"
                     else:
