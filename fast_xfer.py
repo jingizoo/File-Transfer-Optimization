@@ -31,6 +31,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
+# Try to import select for non-blocking I/O (Unix only)
+try:
+    import select
+    HAS_SELECT = True
+except ImportError:
+    HAS_SELECT = False
+    select = None
+
 
 def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
@@ -178,11 +186,12 @@ def get_compressor_cmd(compressor: str) -> Optional[tuple[str, str, str]]:
     return None
 
 
-def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_bytes: int) -> Optional[Tuple[float, int, int]]:
+def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_bytes: int, timeout: int = 30) -> Optional[Tuple[float, int, int]]:
     """
     Return (ratio, in_bytes, out_bytes) for a sample.
     ratio = out/in (lower is better).
     Supports zstd, pigz, gzip.
+    timeout: seconds to wait before giving up (default: 30)
     """
     comp_info = get_compressor_cmd(compressor)
     if not comp_info:
@@ -211,15 +220,22 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
     )
     assert p.stdin is not None and p.stdout is not None
 
+    start_time = time.time()
+    
     try:
+        # Write input with timeout check
         with src.open("rb") as f:
             remaining = sample_bytes
             while remaining > 0:
+                if time.time() - start_time > timeout:
+                    eprint(f"[estimate] Timeout after {timeout}s, skipping compression estimation")
+                    break
                 chunk = f.read(min(1024 * 1024, remaining))
                 if not chunk:
                     break
                 try:
                     p.stdin.write(chunk)
+                    p.stdin.flush()  # Ensure data is sent
                     in_bytes += len(chunk)
                     remaining -= len(chunk)
                 except BrokenPipeError:
@@ -230,14 +246,66 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
         except BrokenPipeError:
             pass
 
+        # Read output with timeout
+        # Use simpler approach: read in chunks with timeout checks
         while True:
-            chunk = p.stdout.read(1024 * 1024)
-            if not chunk:
+            if time.time() - start_time > timeout:
+                eprint(f"[estimate] Timeout reading output after {timeout}s")
                 break
-            out_bytes += len(chunk)
-        p.stdout.close()
+                
+            # Check if process is done
+            if p.poll() is not None:
+                # Process finished, read remaining
+                remaining = p.stdout.read(1024 * 1024)
+                if remaining:
+                    out_bytes += len(remaining)
+                break
+            
+            # Try to read (may block briefly, but we check timeout)
+            try:
+                if HAS_SELECT and sys.platform != "win32":
+                    # Unix: use select for non-blocking check
+                    ready, _, _ = select.select([p.stdout], [], [], 0.5)
+                    if ready:
+                        chunk = p.stdout.read(1024 * 1024)
+                        if not chunk:
+                            if p.poll() is not None:
+                                break
+                            continue
+                        out_bytes += len(chunk)
+                    elif p.poll() is not None:
+                        # Process finished
+                        chunk = p.stdout.read(1024 * 1024)
+                        if chunk:
+                            out_bytes += len(chunk)
+                        break
+                else:
+                    # Windows or no select: read with small timeout
+                    chunk = p.stdout.read(1024 * 1024)
+                    if not chunk:
+                        if p.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                        continue
+                    out_bytes += len(chunk)
+            except (OSError, ValueError):
+                # Pipe closed or error
+                break
+        
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
 
-        rc = p.wait()
+        # Wait for process with timeout
+        try:
+            rc = p.wait(timeout=max(1, timeout - (time.time() - start_time)))
+        except subprocess.TimeoutExpired:
+            eprint(f"[estimate] Process timeout, killing")
+            p.kill()
+            p.wait()
+            return None
+            
         if rc != 0 or in_bytes == 0:
             return None
         ratio = out_bytes / in_bytes
@@ -249,6 +317,7 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
         try:
             if p.poll() is None:
                 p.kill()
+                p.wait()
             # Clean up stdin/stdout if still open
             try:
                 if p.stdin and not p.stdin.closed:
@@ -706,7 +775,7 @@ def main() -> int:
     p.add_argument("source", type=Path, help="Source file path on this machine")
     p.add_argument("target", help="Target: /abs/path (local) OR user@10.0.0.15:/abs/path OR 10.0.0.15:/abs/path (remote, absolute path required)")
     p.add_argument("--user", default=None, help="SSH user (if not provided in target)")
-    p.add_argument("--strategy", choices=["auto", "direct", "compress", "chunked"], default="auto", help="Transfer strategy")
+    p.add_argument("--strategy", choices=["auto", "direct", "compress", "chunked"], default="auto", help="Transfer strategy (chunked=split+transfer, use --compress-chunks for split+compress)")
     p.add_argument("--append-only", action="store_true", help="Use rsync --append-verify (only if file only grows by appending)")
     p.add_argument("--whole-file", action="store_true", help="Use rsync --whole-file (fastest first transfer, weakest resume)")
     p.add_argument("--inplace", action="store_true", help="Use rsync --inplace (better resume semantics; can be riskier if interrupted)")
@@ -727,6 +796,8 @@ def main() -> int:
     p.add_argument("--zstd-level", type=int, default=3, help="[DEPRECATED] Use --compression-level instead. zstd compression level (1=fast, 3=default)")
     p.add_argument("--auto-sample-mib", type=int, default=256, help="Auto mode: sample size (MiB) to estimate compressibility")
     p.add_argument("--auto-threshold", type=float, default=0.85, help="Auto mode: choose compress if compression(out/in) <= threshold")
+    p.add_argument("--skip-estimate", action="store_true", help="Skip compression estimation in auto mode (use direct transfer)")
+    p.add_argument("--estimate-timeout", type=int, default=30, help="Timeout in seconds for compression estimation (default: 30)")
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
 
     args = p.parse_args()
@@ -780,11 +851,16 @@ def main() -> int:
             compressor = args.compressor
             comp_info = get_compressor_cmd(compressor)
             
-            if is_local:
+            if args.skip_estimate:
+                # Skip estimation, use direct
+                eprint("[auto] Skipping compression estimation (--skip-estimate)")
+                strategy = "direct"
+            elif is_local:
                 # For local, check if compressor is available
                 if comp_info:
+                    eprint(f"[auto] Estimating compression ratio with {compressor}...")
                     sample_bytes = args.auto_sample_mib * 1024**2
-                    est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes)
+                    est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes, args.estimate_timeout)
                     if est:
                         ratio, in_b, out_b = est
                         eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
@@ -793,6 +869,7 @@ def main() -> int:
                         else:
                             strategy = "direct"
                     else:
+                        eprint("[auto] Compression estimation failed or timed out, using direct transfer")
                         strategy = "direct"
                 else:
                     strategy = "direct"
@@ -809,8 +886,9 @@ def main() -> int:
                         remote_cmd_check = decomp_cmd
                     
                     if remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                        eprint(f"[auto] Estimating compression ratio with {compressor}...")
                         sample_bytes = args.auto_sample_mib * 1024**2
-                        est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes)
+                        est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes, args.estimate_timeout)
                         if est:
                             ratio, in_b, out_b = est
                             eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
@@ -819,6 +897,7 @@ def main() -> int:
                             else:
                                 strategy = "direct"
                         else:
+                            eprint("[auto] Compression estimation failed or timed out, using direct transfer")
                             strategy = "direct"
                     else:
                         strategy = "direct"
