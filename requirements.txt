@@ -1,0 +1,9 @@
+# fast-xfer uses only Python standard library
+# No external Python dependencies required
+#
+# System dependencies (install via package manager):
+# - ssh (OpenSSH)
+# - rsync
+# - zstd (optional, for compression strategies)
+# - split (optional, for chunked strategy)
+
