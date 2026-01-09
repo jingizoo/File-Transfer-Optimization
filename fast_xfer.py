@@ -195,12 +195,11 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
     # Build compression command based on algorithm
     if compressor == "zstd":
         cmd = [comp_cmd, f"-{level}", "-T0", "-c", "--no-progress"]
-    elif compressor in ("pigz", "gzip"):
-        # pigz uses -p for threads, gzip doesn't support threads
-        if comp_cmd == "pigz":
-            cmd = [comp_cmd, f"-{level}", "-p", "0", "-c"]
-        else:
-            cmd = [comp_cmd, f"-{level}", "-c"]
+    elif compressor == "pigz":
+        # pigz: use default threads for sampling (omit -p for auto)
+        cmd = [comp_cmd, f"-{level}", "-c"]
+    elif compressor == "gzip":
+        cmd = [comp_cmd, f"-{level}", "-c"]
     else:
         return None
 
@@ -219,10 +218,17 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
                 chunk = f.read(min(1024 * 1024, remaining))
                 if not chunk:
                     break
-                p.stdin.write(chunk)
-                in_bytes += len(chunk)
-                remaining -= len(chunk)
-        p.stdin.close()
+                try:
+                    p.stdin.write(chunk)
+                    in_bytes += len(chunk)
+                    remaining -= len(chunk)
+                except BrokenPipeError:
+                    # Process terminated early, check return code
+                    break
+        try:
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
 
         while True:
             chunk = p.stdout.read(1024 * 1024)
@@ -236,10 +242,24 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
             return None
         ratio = out_bytes / in_bytes
         return ratio, in_bytes, out_bytes
+    except BrokenPipeError:
+        # Process terminated early, likely an error
+        return None
     finally:
         try:
             if p.poll() is None:
                 p.kill()
+            # Clean up stdin/stdout if still open
+            try:
+                if p.stdin and not p.stdin.closed:
+                    p.stdin.close()
+            except Exception:
+                pass
+            try:
+                if p.stdout and not p.stdout.closed:
+                    p.stdout.close()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -359,8 +379,12 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
         run_stream(cmd)
     elif compressor == "pigz":
         threads = args.compression_threads if hasattr(args, 'compression_threads') else 0
-        cmd = [comp_cmd, f"-{comp_level}", "-p", str(threads), str(src)]
-        # pigz doesn't support -o, so we redirect stdout
+        # pigz: -p for threads (0=auto), -c for stdout, input file last
+        if threads > 0:
+            cmd = [comp_cmd, f"-{comp_level}", "-p", str(threads), "-c", str(src)]
+        else:
+            cmd = [comp_cmd, f"-{comp_level}", "-c", str(src)]
+        # pigz -c outputs to stdout, redirect to file
         with open(comp_local, "wb") as out:
             subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
     elif compressor == "gzip":
