@@ -95,3 +95,47 @@ fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
   --strategy compress \
   --compressor pigz \
   --compression-level 1
+
+# Example 15: Skip estimation to avoid hanging (fast start)
+echo "Example 15: Skip compression estimation (fast start, no hanging)"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
+  --strategy auto \
+  --skip-estimate
+
+# Example 16: Split + compress (for very large files)
+echo "Example 16: Split + compress (chunked with compression)"
+fast-xfer /data/hugefile.txt user@10.0.0.15:/data/replica/ \
+  --strategy chunked \
+  --compress-chunks \
+  --compressor pigz \
+  --compression-level 6 \
+  --chunk-size 10G \
+  --parallel 4 \
+  --cleanup-local-parts
+
+# Example 17: Split + compress with zstd (better compression)
+echo "Example 17: Split + compress with zstd"
+fast-xfer /data/hugefile.txt user@10.0.0.15:/data/replica/ \
+  --strategy chunked \
+  --compress-chunks \
+  --compressor zstd \
+  --compression-level 3 \
+  --chunk-size 20G \
+  --parallel 6 \
+  --cleanup-local-parts
+
+# Example 18: Local transfer with skip-estimate (fast)
+echo "Example 18: Local transfer skipping estimation"
+fast-xfer /mnt/disk1/file.txt /mnt/disk2/replica/ \
+  --skip-estimate
+
+# Example 19: Reduce estimation timeout (faster fallback)
+echo "Example 19: Auto mode with short estimation timeout"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
+  --strategy auto \
+  --estimate-timeout 10
+
+# Example 20: Direct transfer (bypasses all auto-detection)
+echo "Example 20: Direct transfer (no compression, no estimation)"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
+  --strategy direct
