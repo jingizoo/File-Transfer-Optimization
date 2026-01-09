@@ -69,16 +69,30 @@ def run_stream(cmd: list[str], *, env: Optional[dict[str, str]] = None) -> None:
 TARGET_RE = re.compile(r"^(?:(?P<user>[^@]+)@)?(?P<host>[^:]+):(?P<path>.+)$")
 
 
-def parse_target(target: str, default_user: Optional[str]) -> Tuple[str, str, str]:
+def parse_target(target: str, default_user: Optional[str]) -> Tuple[bool, Optional[str], Optional[str], str]:
     """
     Parse target like:
-      user@10.0.0.15:/data/path
-      10.0.0.15:/data/path
-    Returns (user, host, path).
+      user@10.0.0.15:/data/path  (remote)
+      10.0.0.15:/data/path        (remote)
+      /data/path                  (local)
+    Returns (is_local, user, host, path).
     """
-    m = TARGET_RE.match(target.strip())
+    target = target.strip()
+    
+    # Check if it's a local path (absolute path without user@host: prefix)
+    if target.startswith("/") and ":" not in target:
+        # Local path - no user, no host
+        return True, None, None, target
+    
+    # Try to match remote pattern
+    m = TARGET_RE.match(target)
     if not m:
-        raise ValueError("Target must look like user@host:/abs/path or host:/abs/path")
+        # If it doesn't match remote pattern but starts with /, treat as local
+        if target.startswith("/"):
+            return True, None, None, target
+        raise ValueError("Target must be an absolute path (/path) or remote (user@host:/path or host:/path)")
+    
+    # Remote path
     user = m.group("user") or (default_user or os.getenv("USER") or "")
     host = m.group("host")
     path = m.group("path")
@@ -86,7 +100,7 @@ def parse_target(target: str, default_user: Optional[str]) -> Tuple[str, str, st
         raise ValueError("Could not determine ssh user; pass target as user@host:/path or set --user")
     if not path.startswith("/"):
         raise ValueError("Target path must be an absolute path (start with /)")
-    return user, host, path
+    return False, user, host, path
 
 
 def ssh_base_args(connect_timeout: int, cipher: str, control_path: Optional[str]) -> list[str]:
@@ -206,7 +220,7 @@ def human_bytes(n: int) -> str:
 def build_rsync_cmd(
     src: str,
     dest: str,
-    ssh_e: str,
+    ssh_e: Optional[str],
     *,
     append_only: bool,
     whole_file: bool,
@@ -221,8 +235,9 @@ def build_rsync_cmd(
         "--partial",
         "--protect-args",
         f"--timeout={timeout}",
-        "-e", ssh_e,
     ]
+    if ssh_e:
+        cmd.extend(["-e", ssh_e])
     if inplace:
         cmd.append("--inplace")
     if preallocate:
@@ -237,23 +252,26 @@ def build_rsync_cmd(
 
 def normalize_dest_path(target_path: str, src_file: Path) -> Tuple[str, str]:
     """
-    Decide remote_dir and remote_file path.
+    Decide dest_dir and dest_file path.
     Heuristic:
       - if target_path ends with '/', treat as directory
       - else treat as file path
-    Returns (remote_dir, remote_file)
+    Returns (dest_dir, dest_file)
     """
     if target_path.endswith("/"):
-        remote_dir = target_path.rstrip("/")
-        remote_file = f"{remote_dir}/{src_file.name}"
-        return remote_dir, remote_file
-    remote_file = target_path
-    remote_dir = str(Path(target_path).parent)
-    return remote_dir, remote_file
+        dest_dir = target_path.rstrip("/")
+        dest_file = f"{dest_dir}/{src_file.name}"
+        return dest_dir, dest_file
+    dest_file = target_path
+    dest_dir = str(Path(target_path).parent)
+    return dest_dir, dest_file
 
 
-def strategy_direct(args: argparse.Namespace, user: str, host: str, remote_file: str, ssh_e: str) -> None:
-    dest = f"{user}@{host}:{remote_file}"
+def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str]) -> None:
+    if is_local:
+        dest = dest_file
+    else:
+        dest = f"{user}@{host}:{dest_file}"
     cmd = build_rsync_cmd(
         str(args.source),
         dest,
@@ -267,24 +285,30 @@ def strategy_direct(args: argparse.Namespace, user: str, host: str, remote_file:
     run_stream(cmd)
 
 
-def strategy_compress(args: argparse.Namespace, user: str, host: str, remote_file: str, ssh_e: str, control_path: Optional[str], cipher: str) -> None:
+def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
     if which("zstd") is None:
-        raise RuntimeError("Strategy 'compress' requires zstd installed on SOURCE (command: zstd).")
-    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
-        raise RuntimeError("Strategy 'compress' requires zstd installed on TARGET as well (command: zstd).")
+        raise RuntimeError("Strategy 'compress' requires zstd installed (command: zstd).")
+    
+    if not is_local:
+        assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+        if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
+            raise RuntimeError("Strategy 'compress' requires zstd installed on TARGET as well (command: zstd).")
 
     src = Path(args.source).resolve()
     workdir = Path(args.workdir).resolve() if args.workdir else src.parent
     workdir.mkdir(parents=True, exist_ok=True)
 
     zst_local = workdir / (src.name + ".zst")
-    zst_remote = remote_file + ".zst"
+    zst_dest = dest_file + ".zst"
 
     eprint(f"[compress] Compressing {src.name} with zstd level {args.zstd_level}...")
     run_stream(["zstd", f"-{args.zstd_level}", "-T0", "--no-progress", "-o", str(zst_local), str(src)])
 
     eprint(f"[compress] Transferring compressed file...")
-    dest = f"{user}@{host}:{zst_remote}"
+    if is_local:
+        dest = zst_dest
+    else:
+        dest = f"{user}@{host}:{zst_dest}"
     cmd = build_rsync_cmd(
         str(zst_local),
         dest,
@@ -297,17 +321,29 @@ def strategy_compress(args: argparse.Namespace, user: str, host: str, remote_fil
     )
     run_stream(cmd)
 
-    eprint(f"[compress] Decompressing on remote host...")
-    remote_cmd = f"""
+    eprint(f"[compress] Decompressing on destination...")
+    if is_local:
+        # Local decompression
+        if which("unzstd"):
+            run_checked(["unzstd", "-T0", "-f", "--rm", str(zst_dest)])
+        else:
+            run_checked(["zstd", "-d", "-T0", "-f", str(zst_dest)])
+            try:
+                Path(zst_dest).unlink()
+            except FileNotFoundError:
+                pass
+    else:
+        # Remote decompression
+        remote_cmd = f"""
 set -euo pipefail
 if command -v unzstd >/dev/null 2>&1; then
-  unzstd -T0 -f --rm {shlex.quote(zst_remote)}
+  unzstd -T0 -f --rm {shlex.quote(zst_dest)}
 else
-  zstd -d -T0 -f {shlex.quote(zst_remote)}
-  rm -f {shlex.quote(zst_remote)}
+  zstd -d -T0 -f {shlex.quote(zst_dest)}
+  rm -f {shlex.quote(zst_dest)}
 fi
 """
-    run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
+        run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
 
     if not args.keep_local_artifact:
         try:
@@ -368,14 +404,18 @@ def compress_parts(parts: list[Path], level: int, parallel: int, keep_parts: boo
 
 def rsync_many_parallel(
     files: list[Path],
-    user: str,
-    host: str,
-    remote_dir: str,
-    ssh_e: str,
+    is_local: bool,
+    user: Optional[str],
+    host: Optional[str],
+    dest_dir: str,
+    ssh_e: Optional[str],
     parallel: int,
     rsync_timeout: int,
 ) -> None:
-    dest_dir = f"{user}@{host}:{remote_dir.rstrip('/')}/"
+    if is_local:
+        dest_dir_str = f"{dest_dir.rstrip('/')}/"
+    else:
+        dest_dir_str = f"{user}@{host}:{dest_dir.rstrip('/')}/"
 
     eprint(f"[chunked] Transferring {len(files)} files in parallel (workers={parallel})...")
 
@@ -387,10 +427,10 @@ def rsync_many_parallel(
             "--protect-args",
             f"--timeout={rsync_timeout}",
             "--whole-file",
-            "-e", ssh_e,
-            str(p),
-            dest_dir,
         ]
+        if ssh_e:
+            cmd.extend(["-e", ssh_e])
+        cmd.extend([str(p), dest_dir_str])
         run_stream(cmd)
 
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
@@ -401,7 +441,11 @@ def rsync_many_parallel(
     eprint(f"[chunked] All parts transferred")
 
 
-def strategy_chunked(args: argparse.Namespace, user: str, host: str, remote_file: str, remote_dir: str, ssh_e: str, control_path: Optional[str], cipher: str) -> None:
+def local_mkdir_p(directory: str) -> None:
+    Path(directory).mkdir(parents=True, exist_ok=True)
+
+
+def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, dest_dir: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
     src = Path(args.source).resolve()
     if args.workdir:
         workdir = Path(args.workdir).resolve()
@@ -418,20 +462,28 @@ def strategy_chunked(args: argparse.Namespace, user: str, host: str, remote_file
 
     parts_to_send: list[Path] = parts
     if args.compress_chunks:
-        if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
-            raise RuntimeError("Chunk compression requires zstd installed on TARGET as well (command: zstd).")
+        if not is_local:
+            assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+            if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
+                raise RuntimeError("Chunk compression requires zstd installed on TARGET as well (command: zstd).")
+        if is_local and which("zstd") is None:
+            raise RuntimeError("Chunk compression requires zstd installed (command: zstd).")
         parts_to_send = compress_parts(parts, args.zstd_level, args.parallel, keep_parts=args.keep_local_parts)
 
-    stage_dir = f"{remote_dir.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
-    remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, stage_dir)
+    stage_dir = f"{dest_dir.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
+    if is_local:
+        local_mkdir_p(stage_dir)
+    else:
+        assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+        remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, stage_dir)
 
-    rsync_many_parallel(parts_to_send, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout)
+    rsync_many_parallel(parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout)
 
-    eprint(f"[chunked] Reassembling file on remote host...")
+    eprint(f"[chunked] Reassembling file on destination...")
     stage_q = shlex.quote(stage_dir)
-    dest_q = shlex.quote(remote_file)
+    dest_q = shlex.quote(dest_file)
     if args.compress_chunks:
-        remote_assemble = f"""
+        assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -446,7 +498,7 @@ cd /
 rmdir {stage_q} || true
 """
     else:
-        remote_assemble = f"""
+        assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -460,7 +512,10 @@ mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
-    run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_assemble])
+    if is_local:
+        run_checked(["bash", "-c", assemble_cmd])
+    else:
+        run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", assemble_cmd])
 
     if args.cleanup_local_parts:
         for p in parts_to_send:
@@ -495,13 +550,18 @@ def sha256sum_remote(user: str, host: str, connect_timeout: int, cipher: str, co
     return out
 
 
+def sha256sum_local_path(path: str) -> str:
+    h = subprocess.run(["sha256sum", path], check=True, stdout=subprocess.PIPE, text=True).stdout.strip().split()[0]
+    return h
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Highly-tuned Linux-to-Linux file transfer wrapper (rsync/ssh, optional zstd, optional chunk parallelism).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("source", type=Path, help="Source file path on this machine")
-    p.add_argument("target", help="Target like user@10.0.0.15:/abs/path OR 10.0.0.15:/abs/path (absolute path required)")
+    p.add_argument("target", help="Target: /abs/path (local) OR user@10.0.0.15:/abs/path OR 10.0.0.15:/abs/path (remote, absolute path required)")
     p.add_argument("--user", default=None, help="SSH user (if not provided in target)")
     p.add_argument("--strategy", choices=["auto", "direct", "compress", "chunked"], default="auto", help="Transfer strategy")
     p.add_argument("--append-only", action="store_true", help="Use rsync --append-verify (only if file only grows by appending)")
@@ -530,19 +590,28 @@ def main() -> int:
         eprint(f"ERROR: source file not found: {src}")
         return 2
 
-    if which("rsync") is None or which("ssh") is None:
-        eprint("ERROR: requires rsync and ssh installed on SOURCE.")
+    if which("rsync") is None:
+        eprint("ERROR: requires rsync installed.")
         return 2
 
-    user, host, target_path = parse_target(args.target, args.user)
-    remote_dir, remote_file = normalize_dest_path(target_path, src)
+    is_local, user, host, target_path = parse_target(args.target, args.user)
+    dest_dir, dest_file = normalize_dest_path(target_path, src)
 
-    control_path = f"/tmp/sshcm-{os.getpid()}-%r@%h:%p"
-
-    cipher = pick_ssh_cipher(user, host, args.connect_timeout, control_path)
-    ssh_e = ssh_cmd_str(args.connect_timeout, cipher, control_path)
-
-    remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, remote_dir)
+    # For local transfers, we don't need SSH
+    if is_local:
+        eprint("[local] Detected local path - using direct file operations")
+        local_mkdir_p(dest_dir)
+        ssh_e = None
+        control_path = None
+        cipher = None
+    else:
+        if which("ssh") is None:
+            eprint("ERROR: requires ssh installed for remote transfers.")
+            return 2
+        control_path = f"/tmp/sshcm-{os.getpid()}-%r@%h:%p"
+        cipher = pick_ssh_cipher(user, host, args.connect_timeout, control_path)
+        ssh_e = ssh_cmd_str(args.connect_timeout, cipher, control_path)
+        remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, dest_dir)
 
     strategy = args.strategy
     if strategy == "auto":
@@ -553,40 +622,64 @@ def main() -> int:
         if args.append_only:
             strategy = "direct"
         else:
-            if which("zstd") and remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
-                sample_bytes = args.auto_sample_mib * 1024**2
-                est = estimate_zstd_ratio(src, args.zstd_level, sample_bytes)
-                if est:
-                    ratio, in_b, out_b = est
-                    eprint(f"[auto] zstd sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
-                    if ratio <= args.auto_threshold:
-                        strategy = "compress"
+            if is_local:
+                # For local, just check if zstd is available
+                if which("zstd"):
+                    sample_bytes = args.auto_sample_mib * 1024**2
+                    est = estimate_zstd_ratio(src, args.zstd_level, sample_bytes)
+                    if est:
+                        ratio, in_b, out_b = est
+                        eprint(f"[auto] zstd sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
+                        if ratio <= args.auto_threshold:
+                            strategy = "compress"
+                        else:
+                            strategy = "direct"
                     else:
                         strategy = "direct"
                 else:
                     strategy = "direct"
             else:
-                strategy = "direct"
+                assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+                if which("zstd") and remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
+                    sample_bytes = args.auto_sample_mib * 1024**2
+                    est = estimate_zstd_ratio(src, args.zstd_level, sample_bytes)
+                    if est:
+                        ratio, in_b, out_b = est
+                        eprint(f"[auto] zstd sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
+                        if ratio <= args.auto_threshold:
+                            strategy = "compress"
+                        else:
+                            strategy = "direct"
+                    else:
+                        strategy = "direct"
+                else:
+                    strategy = "direct"
 
     start = time.time()
-    eprint(f"=== Strategy: {strategy} | src={src} -> {user}@{host}:{remote_file} ===")
+    if is_local:
+        eprint(f"=== Strategy: {strategy} | src={src} -> {dest_file} (local) ===")
+    else:
+        eprint(f"=== Strategy: {strategy} | src={src} -> {user}@{host}:{dest_file} ===")
 
     try:
         if strategy == "direct":
-            strategy_direct(args, user, host, remote_file, ssh_e)
+            strategy_direct(args, is_local, user, host, dest_file, ssh_e)
         elif strategy == "compress":
-            strategy_compress(args, user, host, remote_file, ssh_e, control_path, cipher)
+            strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
         elif strategy == "chunked":
-            strategy_chunked(args, user, host, remote_file, remote_dir, ssh_e, control_path, cipher)
+            strategy_chunked(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
         else:
             raise RuntimeError(f"Unknown strategy: {strategy}")
 
         if args.verify_sha256:
             eprint("=== Verifying sha256 (this will read the full file on both ends) ===")
             local_h = sha256sum_local(src)
-            remote_h = sha256sum_remote(user, host, args.connect_timeout, cipher, control_path, remote_file)
-            eprint(f"local sha256:  {local_h}")
-            eprint(f"remote sha256: {remote_h}")
+            if is_local:
+                remote_h = sha256sum_local_path(dest_file)
+            else:
+                remote_h = sha256sum_remote(user, host, args.connect_timeout, cipher, control_path, dest_file)
+            eprint(f"source sha256:  {local_h}")
+            eprint(f"dest sha256:    {remote_h}")
             if local_h != remote_h:
                 raise RuntimeError("sha256 mismatch: transfer may be corrupted")
 

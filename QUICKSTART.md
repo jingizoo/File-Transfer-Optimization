@@ -30,10 +30,13 @@ chmod +x fast_xfer.py
 ## Basic Usage
 
 ```bash
-# Simple transfer (auto-detects best strategy)
+# Remote transfer (auto-detects best strategy)
 fast-xfer /path/to/file.txt user@10.0.0.15:/data/replica/
 
-# With explicit user
+# Local transfer (same server, different mount point)
+fast-xfer /mnt/disk1/file.txt /mnt/disk2/replica/
+
+# With explicit user (remote only)
 fast-xfer /path/to/file.txt 10.0.0.15:/data/replica/ --user myuser
 ```
 

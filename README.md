@@ -29,7 +29,11 @@ pip3 install --user .
 After installation, use `fast-xfer` command:
 
 ```bash
+# Remote transfer
 fast-xfer /path/to/file.txt user@10.0.0.15:/data/replica/
+
+# Local transfer (same server, different mount point)
+fast-xfer /mnt/disk1/file.txt /mnt/disk2/replica/
 ```
 
 #### Option 2: Direct script usage
@@ -51,19 +55,21 @@ bash install.sh
 
 ### Prerequisites
 
-**Required on both source and target machines:**
-- `ssh` (OpenSSH)
-- `rsync`
+**Required:**
+- `rsync` (always required)
+
+**For remote transfers:**
+- `ssh` (OpenSSH) on source machine
+- Key-based authentication must be configured (non-interactive)
+- Test with: `ssh user@host true` (should work without password)
 
 **Optional (for compression strategies):**
-- `zstd` on both ends
+- `zstd` (on source, and on target for remote transfers)
 
 **Optional (for chunked strategy):**
 - `split` command on source
 
-**SSH Setup:**
-- Key-based authentication must be configured (non-interactive)
-- Test with: `ssh user@host true` (should work without password)
+**Note:** For local transfers (same server, different mount points), only `rsync` is required. No SSH needed.
 
 ## Usage Examples
 
@@ -72,7 +78,11 @@ bash install.sh
 Automatically chooses the best strategy based on file compressibility:
 
 ```bash
+# Remote transfer
 fast-xfer /data/bigfile.txt 10.0.0.15:/data/replica/
+
+# Local transfer (same server, different mount)
+fast-xfer /mnt/disk1/bigfile.txt /mnt/disk2/replica/
 ```
 
 ### 2. Force compression (best for huge text files)
@@ -248,7 +258,26 @@ ssh user@host true
 
 - Source: Can be relative or absolute
 - Target: **Must be absolute** (start with `/`)
+  - **Local path**: `/path/to/dest` (for same-server transfers, different mount points)
+  - **Remote path**: `user@host:/path/to/dest` or `host:/path/to/dest`
 - If target ends with `/`, it's treated as a directory (keeps same filename)
+
+### Local vs Remote Transfers
+
+**Local transfers** (same server, different mount points):
+```bash
+fast-xfer /mnt/disk1/file.txt /mnt/disk2/replica/
+```
+- No SSH required
+- Faster (no network overhead)
+- Uses direct rsync without SSH wrapper
+
+**Remote transfers** (different servers):
+```bash
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/
+```
+- Requires SSH key-based authentication
+- Uses optimized SSH + rsync
 
 ## Troubleshooting
 
@@ -261,13 +290,17 @@ fast-xfer file.txt 10.0.0.15:/path/ --user myuser
 
 ### "Target path must be an absolute path"
 
-Use absolute paths on remote:
+Use absolute paths:
 ```bash
 # Wrong
 fast-xfer file.txt user@host:relative/path
+fast-xfer file.txt relative/path
 
-# Correct
+# Correct (remote)
 fast-xfer file.txt user@host:/absolute/path
+
+# Correct (local)
+fast-xfer file.txt /absolute/path
 ```
 
 ### "requires zstd installed"

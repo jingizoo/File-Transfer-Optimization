@@ -1,9 +1,13 @@
 #!/bin/bash
 # Example usage scenarios for fast-xfer
 
-# Example 1: Basic auto transfer
-echo "Example 1: Basic auto transfer"
+# Example 1: Basic auto transfer (remote)
+echo "Example 1: Basic auto transfer (remote)"
 fast-xfer /data/file.txt user@10.0.0.15:/data/replica/
+
+# Example 1b: Basic auto transfer (local - same server, different mount)
+echo "Example 1b: Basic auto transfer (local)"
+fast-xfer /mnt/disk1/file.txt /mnt/disk2/replica/
 
 # Example 2: Force compression for large text file
 echo "Example 2: Force compression"
