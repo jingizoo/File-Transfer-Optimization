@@ -379,14 +379,15 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
         run_stream(cmd)
     elif compressor == "pigz":
         threads = args.compression_threads if hasattr(args, 'compression_threads') else 0
-        # pigz: -p for threads (0=auto), -c for stdout, input file last
+        # pigz: when using -c, it reads from stdin, so we need to redirect input
+        # Build command: pigz -9 [-p N] -c
         if threads > 0:
-            cmd = [comp_cmd, f"-{comp_level}", "-p", str(threads), "-c", str(src)]
+            cmd = [comp_cmd, f"-{comp_level}", "-p", str(threads), "-c"]
         else:
-            cmd = [comp_cmd, f"-{comp_level}", "-c", str(src)]
-        # pigz -c outputs to stdout, redirect to file
-        with open(comp_local, "wb") as out:
-            subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
+            cmd = [comp_cmd, f"-{comp_level}", "-c"]
+        # pigz -c reads from stdin and outputs to stdout
+        with open(src, "rb") as infile, open(comp_local, "wb") as outfile:
+            subprocess.run(cmd, stdin=infile, stdout=outfile, check=True, stderr=subprocess.PIPE)
     elif compressor == "gzip":
         cmd = [comp_cmd, f"-{comp_level}", "-c", str(src)]
         # gzip -c outputs to stdout
@@ -492,9 +493,10 @@ def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int
         if compressor == "zstd":
             run_checked([comp_cmd, f"-{level}", "-T1", "--no-progress", "-o", str(comp_file), str(p)])
         elif compressor == "pigz":
-            cmd = [comp_cmd, f"-{level}", "-p", "1", "-c", str(p)]
-            with open(comp_file, "wb") as out:
-                subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
+            # pigz -c reads from stdin, so redirect input
+            cmd = [comp_cmd, f"-{level}", "-p", "1", "-c"]
+            with open(p, "rb") as infile, open(comp_file, "wb") as outfile:
+                subprocess.run(cmd, stdin=infile, stdout=outfile, check=True, stderr=subprocess.PIPE)
         elif compressor == "gzip":
             cmd = [comp_cmd, f"-{level}", "-c", str(p)]
             with open(comp_file, "wb") as out:
