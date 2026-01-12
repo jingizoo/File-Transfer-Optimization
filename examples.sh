@@ -203,16 +203,27 @@ fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --keep-compressed \
   --cleanup-local-parts
 
-# Example 36: Stream transfer with zstd (compress and transfer simultaneously)
-echo "Example 36: Stream transfer - Compress and transfer simultaneously (no pre-compression wait)"
+# Example 36: Stream transfer - COMPRESS + TRANSFER + DECOMPRESS all at once (BEST for real-time pipeline)
+echo "Example 36: Stream transfer - Compress, transfer, and decompress ALL AT ONCE (no waiting)"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
+  --strategy stream \
+  --compressor pigz \
+  --compression-level 6 \
+  --compression-threads 0 \
+  --decompression-threads 0
+# Note: By default, decompresses on destination automatically (use --keep-compressed to skip)
+
+# Example 37: Stream transfer with zstd (compress + transfer + decompress simultaneously)
+echo "Example 37: Stream transfer with zstd - All operations happen simultaneously"
 fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --strategy stream \
   --compressor zstd \
   --compression-level 3 \
-  --compression-threads 0
+  --compression-threads 0 \
+  --decompression-threads 0
 
-# Example 37: Stream transfer with pigz (keep compressed)
-echo "Example 37: Stream transfer with pigz, keep compressed"
+# Example 38: Stream transfer with pigz (keep compressed on destination)
+echo "Example 38: Stream transfer with pigz, keep compressed (skip decompression)"
 fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --strategy stream \
   --compressor pigz \

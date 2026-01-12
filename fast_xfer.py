@@ -343,6 +343,50 @@ def human_bytes(n: int) -> str:
     return f"{n}B"
 
 
+def get_decompression_threads(requested: Optional[int]) -> int:
+    """
+    Get optimal number of threads for decompression.
+    If requested is None or 0, auto-detect CPU count.
+    """
+    if requested is not None and requested > 0:
+        return requested
+    try:
+        import multiprocessing
+        return multiprocessing.cpu_count()
+    except:
+        return 4  # fallback
+
+
+def build_fast_decompression_cmd(compressor: str, decomp_cmd: str, threads: int, streaming: bool = False) -> str:
+    """
+    Build optimized decompression command for maximum speed.
+    Returns command string optimized for the given compressor.
+    """
+    if compressor == "zstd":
+        # zstd: use all threads, fast mode, streaming if needed
+        if streaming:
+            # For streaming: -d -c -T{N} --fast
+            return f"zstd -d -c -T{threads} --fast"
+        else:
+            # For file decompression: prefer unzstd if available, use --fast for speed
+            # unzstd is sometimes faster than zstd -d
+            return f"unzstd -T{threads} --fast -f --rm 2>/dev/null || zstd -d -T{threads} --fast -f"
+    elif compressor in ("pigz", "gzip"):
+        # pigz: use parallel decompression with all threads
+        if streaming:
+            # For streaming: pigz -d -c -p {N}
+            return f"pigz -d -c -p {threads} 2>/dev/null || gunzip -c || gzip -d -c"
+        else:
+            # For file decompression: prefer unpigz if available, use all threads
+            return f"unpigz -p {threads} -f 2>/dev/null || pigz -d -p {threads} -f 2>/dev/null || gunzip -f || gzip -d -f"
+    else:
+        # Fallback for other compressors
+        if streaming:
+            return f"{decomp_cmd} -d -c"
+        else:
+            return f"{decomp_cmd} -d -f"
+
+
 def build_rsync_cmd(
     src: str,
     dest: str,
@@ -499,13 +543,9 @@ def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Opt
     else:  # gzip
         comp_cmd_list = [comp_cmd, f"-{comp_level}", "-c", str(src)]
     
-    # Build remote decompression command
-    if compressor == "zstd":
-        remote_decomp_cmd = "zstd -d -c -T0"
-    elif compressor in ("pigz", "gzip"):
-        remote_decomp_cmd = "pigz -d -c -p 4 2>/dev/null || gunzip -c || gzip -d -c"
-    else:
-        remote_decomp_cmd = f"{decomp_cmd} -d -c"
+    # Build remote decompression command (optimized for speed)
+    decomp_threads = get_decompression_threads(getattr(args, 'decompression_threads', None))
+    remote_decomp_cmd = build_fast_decompression_cmd(compressor, decomp_cmd, decomp_threads, streaming=True)
     
     # Build SSH command for remote execution
     ssh_cmd = ssh_base_args(args.connect_timeout, cipher, control_path)
@@ -516,13 +556,15 @@ def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Opt
         remote_cmd = f"cat > {dest_q}{ext}"
         eprint(f"[stream] Streaming compressed data to {dest_q}{ext}...")
     else:
-        # Decompress on-the-fly on remote
+        # Decompress on-the-fly on remote (COMPRESS + TRANSFER + DECOMPRESS all at once!)
         remote_cmd = f"{remote_decomp_cmd} > {dest_q}"
-        eprint(f"[stream] Streaming compressed data, decompressing on remote to {dest_q}...")
+        eprint(f"[stream] Pipeline: COMPRESS → TRANSFER → DECOMPRESS (all simultaneously)")
+        eprint(f"[stream] Using {decomp_threads} threads for decompression on destination")
     
     # Start compression process (reads from file, outputs to stdout)
+    # Note: comp_cmd_list already includes the source file, so we don't add it again
     comp_proc = subprocess.Popen(
-        comp_cmd_list + [str(src)],
+        comp_cmd_list,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -680,36 +722,38 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
         eprint(f"[compress] Keeping compressed file on destination: {comp_dest}")
         eprint(f"[compress] To decompress manually: gunzip {comp_dest} (or zstd -d {comp_dest})")
     else:
-        eprint(f"[compress] Decompressing on destination...")
+        eprint(f"[compress] Decompressing on destination (optimized)...")
+        decomp_threads = get_decompression_threads(getattr(args, 'decompression_threads', None))
+        eprint(f"[compress] Using {decomp_threads} threads for decompression")
+        
         if is_local:
-            # Local decompression
+            # Local decompression (optimized)
             if compressor == "zstd":
+                # Try unzstd first (often faster), then zstd -d
                 if which("unzstd"):
-                    run_checked(["unzstd", "-T0", "-f", "--rm", str(comp_dest)])
+                    cmd = ["unzstd", f"-T{decomp_threads}", "--fast", "-f", "--rm", str(comp_dest)]
                 else:
-                    run_checked([decomp_cmd, "-d", "-T0", "-f", str(comp_dest)])
+                    cmd = [decomp_cmd, "-d", f"-T{decomp_threads}", "--fast", "-f", str(comp_dest)]
+                run_checked(cmd)
+                if not which("unzstd"):
                     try:
                         Path(comp_dest).unlink()
                     except FileNotFoundError:
                         pass
             elif compressor in ("pigz", "gzip"):
-                run_checked([decomp_cmd, "-f", str(comp_dest)])
+                # Try unpigz first (parallel), then pigz -d, then gunzip
+                if which("unpigz"):
+                    run_checked(["unpigz", f"-p{decomp_threads}", "-f", str(comp_dest)])
+                elif which("pigz"):
+                    run_checked(["pigz", "-d", f"-p{decomp_threads}", "-f", str(comp_dest)])
+                else:
+                    run_checked([decomp_cmd, "-f", str(comp_dest)])
         else:
-            # Remote decompression
-            if compressor == "zstd":
-                remote_cmd = f"""
+            # Remote decompression (optimized)
+            decomp_cmd_str = build_fast_decompression_cmd(compressor, decomp_cmd, decomp_threads, streaming=False)
+            remote_cmd = f"""
 set -euo pipefail
-if command -v unzstd >/dev/null 2>&1; then
-  unzstd -T0 -f --rm {shlex.quote(comp_dest)}
-else
-  zstd -d -T0 -f {shlex.quote(comp_dest)}
-  rm -f {shlex.quote(comp_dest)}
-fi
-"""
-            else:  # pigz/gzip
-                remote_cmd = f"""
-set -euo pipefail
-gunzip -f {shlex.quote(comp_dest)} || gzip -d -f {shlex.quote(comp_dest)}
+{decomp_cmd_str} {shlex.quote(comp_dest)}
 """
             run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
 
@@ -1018,13 +1062,16 @@ rmdir {stage_q} || true
         else:
             # Decompress and reassemble - OPTIMIZED: parallel decompression + faster concatenation
             eprint(f"[chunked] Reassembling and decompressing file on destination (optimized)...")
+            decomp_threads = get_decompression_threads(getattr(args, 'decompression_threads', None))
+            eprint(f"[chunked] Using {decomp_threads} threads per chunk for parallel decompression")
+            
             if compressor == "zstd":
-                # zstd supports parallel decompression with -T0
-                decomp_cmd_str = "zstd -d -c -T0"
+                # zstd: use fast mode and all threads for each chunk
+                decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
                 pattern = "part.*.zst"
             elif compressor in ("pigz", "gzip"):
-                # pigz supports parallel decompression with -p
-                decomp_cmd_str = "pigz -d -c -p 4 2>/dev/null || gunzip -c || gzip -d -c"
+                # pigz: use all threads for parallel decompression
+                decomp_cmd_str = f"pigz -d -c -p {decomp_threads} 2>/dev/null || gunzip -c || gzip -d -c"
                 pattern = "part.*.gz"
             else:
                 decomp_cmd_str = f"{decomp_cmd} -d -c"
@@ -1132,6 +1179,7 @@ def main() -> int:
     p.add_argument("--compressor", choices=["zstd", "pigz", "gzip"], default="pigz", help="Compression algorithm (pigz=fast parallel gzip, zstd=better ratio, gzip=fallback)")
     p.add_argument("--compression-level", type=int, default=6, help="Compression level (1=fast, 6=default for pigz/gzip, 3=default for zstd)")
     p.add_argument("--compression-threads", type=int, default=0, help="Threads for compression (0=auto, pigz only)")
+    p.add_argument("--decompression-threads", type=int, default=0, help="Threads for decompression (0=auto, uses all CPU cores by default)")
     p.add_argument("--keep-local-artifact", action="store_true", help="Keep local compressed artifact for compress strategy")
     p.add_argument("--keep-compressed", action="store_true", help="Keep compressed file on destination (skip decompression)")
     p.add_argument("--chunk-size", default="20G", help="Chunk size for chunked strategy (e.g., 4G, 20G, 500M). Optimal: 5-20G for 10G links, 10-50G for 25G+, smaller for slower links")
