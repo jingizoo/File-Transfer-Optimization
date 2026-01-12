@@ -438,6 +438,133 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
         run_stream(cmd)
 
 
+def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
+    """Stream compression: compress and transfer simultaneously (no pre-compression wait)"""
+    compressor = args.compressor
+    comp_info = get_compressor_cmd(compressor)
+    if not comp_info:
+        raise RuntimeError(f"Strategy 'stream' requires {compressor} installed (command: {compressor}).")
+    
+    comp_cmd, decomp_cmd, ext = comp_info
+    
+    if is_local:
+        # For local, streaming doesn't make sense - just use regular compress
+        eprint("[stream] Local transfer detected - using regular compress strategy instead")
+        strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+        return
+    
+    assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+    
+    # Check if remote has the decompressor
+    if compressor == "zstd":
+        remote_cmd_check = "zstd"
+    elif compressor in ("pigz", "gzip"):
+        remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+    else:
+        remote_cmd_check = decomp_cmd
+    
+    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+        raise RuntimeError(f"Strategy 'stream' requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+    
+    src = Path(args.source).resolve()
+    src_size = src.stat().st_size
+    comp_level = args.compression_level
+    
+    eprint(f"[stream] Streaming compression and transfer: {src.name} ({human_bytes(src_size)}) with {compressor} level {comp_level}...")
+    eprint(f"[stream] Compressing and transferring simultaneously (no pre-compression wait)...")
+    
+    transfer_start = time.time()
+    
+    # Build compression command (output to stdout, read from file)
+    if compressor == "zstd":
+        # zstd with parallel threads and stdout output
+        threads = args.compression_threads if hasattr(args, 'compression_threads') and args.compression_threads > 0 else 0
+        if threads == 0:
+            try:
+                import multiprocessing
+                threads = multiprocessing.cpu_count()
+            except:
+                threads = 4
+        comp_cmd_list = [comp_cmd, f"-{comp_level}", "-c", f"-T{threads}", str(src)]
+    elif compressor == "pigz":
+        threads = args.compression_threads if hasattr(args, 'compression_threads') and args.compression_threads > 0 else 0
+        if threads == 0:
+            try:
+                import multiprocessing
+                threads = multiprocessing.cpu_count()
+            except:
+                threads = 4
+        # pigz can read from file and output to stdout
+        comp_cmd_list = [comp_cmd, f"-{comp_level}", "-c", "-p", str(threads), str(src)]
+    else:  # gzip
+        comp_cmd_list = [comp_cmd, f"-{comp_level}", "-c", str(src)]
+    
+    # Build remote decompression command
+    if compressor == "zstd":
+        remote_decomp_cmd = "zstd -d -c -T0"
+    elif compressor in ("pigz", "gzip"):
+        remote_decomp_cmd = "pigz -d -c -p 4 2>/dev/null || gunzip -c || gzip -d -c"
+    else:
+        remote_decomp_cmd = f"{decomp_cmd} -d -c"
+    
+    # Build SSH command for remote execution
+    ssh_cmd = ssh_base_args(args.connect_timeout, cipher, control_path)
+    dest_q = shlex.quote(dest_file)
+    
+    if args.keep_compressed:
+        # Keep compressed on destination
+        remote_cmd = f"cat > {dest_q}{ext}"
+        eprint(f"[stream] Streaming compressed data to {dest_q}{ext}...")
+    else:
+        # Decompress on-the-fly on remote
+        remote_cmd = f"{remote_decomp_cmd} > {dest_q}"
+        eprint(f"[stream] Streaming compressed data, decompressing on remote to {dest_q}...")
+    
+    # Start compression process (reads from file, outputs to stdout)
+    comp_proc = subprocess.Popen(
+        comp_cmd_list + [str(src)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    
+    # Start SSH process (reads from compression stdout, writes to remote)
+    ssh_proc = subprocess.Popen(
+        ssh_cmd + [f"{user}@{host}", remote_cmd],
+        stdin=comp_proc.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    
+    # Close compression stdout in parent (SSH process owns it now)
+    comp_proc.stdout.close()
+    
+    # Wait for both processes
+    comp_stderr = comp_proc.stderr.read()
+    ssh_stdout, ssh_stderr = ssh_proc.communicate()
+    
+    comp_retcode = comp_proc.wait()
+    ssh_retcode = ssh_proc.returncode
+    
+    if comp_retcode != 0:
+        error_msg = comp_stderr.decode('utf-8', errors='ignore') if comp_stderr else "unknown error"
+        raise RuntimeError(f"Compression failed (exit={comp_retcode}): {error_msg}")
+    
+    if ssh_retcode != 0:
+        error_msg = ssh_stderr.decode('utf-8', errors='ignore') if ssh_stderr else "unknown error"
+        raise RuntimeError(f"Transfer failed (exit={ssh_retcode}): {error_msg}")
+    
+    transfer_elapsed = time.time() - transfer_start
+    # Estimate compressed size (use ratio from previous runs or assume similar)
+    # For now, we'll just show transfer time
+    eprint(f"[stream] Transfer completed in {transfer_elapsed:.1f}s")
+    
+    if args.keep_compressed:
+        eprint(f"[stream] Compressed file saved: {dest_file}{ext}")
+        eprint(f"[stream] To decompress manually: {decomp_cmd} -d {dest_file}{ext}")
+    else:
+        eprint(f"[stream] File decompressed on destination: {dest_file}")
+
+
 def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
     compressor = args.compressor
     comp_info = get_compressor_cmd(compressor)
@@ -865,7 +992,7 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         _, decomp_cmd, ext = get_compressor_cmd(compressor) or (None, None, None)
         
         if args.keep_compressed:
-            # Keep compressed chunks and concatenate them
+            # Keep compressed chunks and concatenate them - OPTIMIZED: concatenate all at once
             eprint(f"[chunked] Keeping compressed chunks and concatenating to {dest_q}{ext}...")
             if compressor == "zstd":
                 pattern = "part.*.zst"
@@ -874,58 +1001,70 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             else:
                 pattern = f"part.*{ext}"
             
+            # Optimized: concatenate all files at once instead of sequential append
             assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}{ext}
 tmp="${{dest}}.incomplete.$$"
-: > "$tmp"
-for f in $(ls -1 {pattern} | sort); do
-  cat "$f" >> "$tmp"
-  rm -f "$f"
-done
+files=($(ls -1 {pattern} | sort))
+# Concatenate all compressed chunks at once (much faster than sequential append)
+cat "${{files[@]}}" > "$tmp"
+rm -f "${{files[@]}}"
 mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
         else:
-            # Decompress and reassemble
-            eprint(f"[chunked] Reassembling and decompressing file on destination...")
+            # Decompress and reassemble - OPTIMIZED: parallel decompression + faster concatenation
+            eprint(f"[chunked] Reassembling and decompressing file on destination (optimized)...")
             if compressor == "zstd":
-                decomp_cmd_str = "zstd -d -c"
+                # zstd supports parallel decompression with -T0
+                decomp_cmd_str = "zstd -d -c -T0"
                 pattern = "part.*.zst"
             elif compressor in ("pigz", "gzip"):
-                decomp_cmd_str = "gunzip -c || gzip -d -c"
+                # pigz supports parallel decompression with -p
+                decomp_cmd_str = "pigz -d -c -p 4 2>/dev/null || gunzip -c || gzip -d -c"
                 pattern = "part.*.gz"
             else:
                 decomp_cmd_str = f"{decomp_cmd} -d -c"
                 pattern = f"part.*{ext}"
             
+            # Optimized: decompress in parallel, then concatenate all at once (faster than sequential append)
             assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
 tmp="${{dest}}.incomplete.$$"
-: > "$tmp"
-for f in $(ls -1 {pattern} | sort); do
-  {decomp_cmd_str} "$f" >> "$tmp"
-  rm -f "$f"
+files=($(ls -1 {pattern} | sort))
+# Decompress all chunks in parallel to temp files
+for f in "${{files[@]}}"; do
+  {decomp_cmd_str} "$f" > "$f.decomp" &
 done
+wait  # Wait for all decompressions to finish
+# Concatenate all decompressed chunks at once (much faster than sequential append)
+decomp_files=()
+for f in "${{files[@]}}"; do
+  decomp_files+=("$f.decomp")
+done
+cat "${{decomp_files[@]}}" > "$tmp"
+# Cleanup
+rm -f "${{files[@]}}" "${{decomp_files[@]}}"
 mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
     else:
+        # Optimized: concatenate all chunks at once instead of sequential append
         assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
 tmp="${{dest}}.incomplete.$$"
-: > "$tmp"
-for f in $(ls -1 part.* | sort); do
-  cat "$f" >> "$tmp"
-  rm -f "$f"
-done
+files=($(ls -1 part.* | sort))
+# Concatenate all chunks at once (much faster than sequential append)
+cat "${{files[@]}}" > "$tmp"
+rm -f "${{files[@]}}"
 mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
@@ -981,7 +1120,7 @@ def main() -> int:
     p.add_argument("source", type=Path, help="Source file path on this machine")
     p.add_argument("target", help="Target: /abs/path (local) OR user@10.0.0.15:/abs/path OR 10.0.0.15:/abs/path (remote, absolute path required)")
     p.add_argument("--user", default=None, help="SSH user (if not provided in target)")
-    p.add_argument("--strategy", choices=["auto", "direct", "compress", "chunked"], default="auto", help="Transfer strategy (chunked=split+transfer, use --compress-chunks for split+compress)")
+    p.add_argument("--strategy", choices=["auto", "direct", "compress", "chunked", "stream"], default="auto", help="Transfer strategy (chunked=split+transfer, stream=compress+transfer simultaneously, use --compress-chunks for split+compress)")
     p.add_argument("--append-only", action="store_true", help="Use rsync --append-verify (only if file only grows by appending)")
     p.add_argument("--whole-file", action="store_true", help="Use rsync --whole-file (fastest first transfer, weakest resume)")
     p.add_argument("--inplace", action="store_true", help="Use rsync --inplace (better resume semantics; can be riskier if interrupted)")
@@ -1127,6 +1266,8 @@ def main() -> int:
             strategy_direct(args, is_local, user, host, dest_file, ssh_e)
         elif strategy == "compress":
             strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+        elif strategy == "stream":
+            strategy_stream_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
         elif strategy == "chunked":
             strategy_chunked(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
         else:

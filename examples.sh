@@ -192,6 +192,8 @@ fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --keep-compressed
 
 # Example 35: BEST - Chunked + Compress (FASTEST for large files with good compression)
+echo "Example 35: Chunked + Compress - Parallel compression and transfer (FASTEST)"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --strategy chunked \
   --chunk-size 5G \
   --parallel 4 \
@@ -200,3 +202,19 @@ fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --compression-level 6 \
   --keep-compressed \
   --cleanup-local-parts
+
+# Example 36: Stream transfer with zstd (compress and transfer simultaneously)
+echo "Example 36: Stream transfer - Compress and transfer simultaneously (no pre-compression wait)"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
+  --strategy stream \
+  --compressor zstd \
+  --compression-level 3 \
+  --compression-threads 0
+
+# Example 37: Stream transfer with pigz (keep compressed)
+echo "Example 37: Stream transfer with pigz, keep compressed"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
+  --strategy stream \
+  --compressor pigz \
+  --compression-level 6 \
+  --keep-compressed
