@@ -149,9 +149,44 @@ fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
 echo "Example 22: Temp dir via TMPDIR env var (set before running)"
 # export TMPDIR=/custom/temp
 # fast-xfer /data/file.txt user@10.0.0.15:/data/replica/
-fast-xfer hugefile.dat user@host:/dest/ \
+
+# ============================================================================
+# EXCELLENT COMPRESSION SCENARIOS (20GB -> 679MB = 3.4% ratio)
+# ============================================================================
+
+# Example 31: EXCELLENT compression - Pre-compress then transfer (BEST for 80 Mbps)
+echo "Example 31: Excellent compression (20GB -> 679MB) - Pre-compress strategy"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
+  --strategy compress \
+  --compressor pigz \
+  --compression-level 6 \
+  --compression-threads 0  # Auto-detect CPU cores
+
+# Example 32: Excellent compression with chunked + compress (for very large files)
+echo "Example 32: Excellent compression with chunked strategy"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --strategy chunked \
-  --chunk-size 10G \
+  --chunk-size 5G \
   --parallel 4 \
-  --rsync-compress \
-  --rsync-compress-level 1
+  --compress-chunks \
+  --compressor pigz \
+  --compression-level 6
+
+# Example 33: Keep compressed file on destination (skip decompression)
+echo "Example 33: Keep compressed file on destination (no decompression)"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
+  --strategy compress \
+  --compressor pigz \
+  --compression-level 6 \
+  --keep-compressed
+
+# Example 34: Keep compressed chunks (for chunked strategy)
+echo "Example 34: Keep compressed chunks on destination"
+fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
+  --strategy chunked \
+  --chunk-size 5G \
+  --parallel 4 \
+  --compress-chunks \
+  --compressor pigz \
+  --compression-level 6 \
+  --keep-compressed

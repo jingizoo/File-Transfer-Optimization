@@ -548,24 +548,29 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
         transfer_speed = comp_size / transfer_elapsed if transfer_elapsed > 0 else 0
         eprint(f"[compress] Transfer completed in {transfer_elapsed:.1f}s ({human_bytes(transfer_speed)}/s)")
 
-    eprint(f"[compress] Decompressing on destination...")
-    if is_local:
-        # Local decompression
-        if compressor == "zstd":
-            if which("unzstd"):
-                run_checked(["unzstd", "-T0", "-f", "--rm", str(comp_dest)])
-            else:
-                run_checked([decomp_cmd, "-d", "-T0", "-f", str(comp_dest)])
-                try:
-                    Path(comp_dest).unlink()
-                except FileNotFoundError:
-                    pass
-        elif compressor in ("pigz", "gzip"):
-            run_checked([decomp_cmd, "-f", str(comp_dest)])
+    # Decompress on destination unless --keep-compressed is set
+    if args.keep_compressed:
+        eprint(f"[compress] Keeping compressed file on destination: {comp_dest}")
+        eprint(f"[compress] To decompress manually: gunzip {comp_dest} (or zstd -d {comp_dest})")
     else:
-        # Remote decompression
-        if compressor == "zstd":
-            remote_cmd = f"""
+        eprint(f"[compress] Decompressing on destination...")
+        if is_local:
+            # Local decompression
+            if compressor == "zstd":
+                if which("unzstd"):
+                    run_checked(["unzstd", "-T0", "-f", "--rm", str(comp_dest)])
+                else:
+                    run_checked([decomp_cmd, "-d", "-T0", "-f", str(comp_dest)])
+                    try:
+                        Path(comp_dest).unlink()
+                    except FileNotFoundError:
+                        pass
+            elif compressor in ("pigz", "gzip"):
+                run_checked([decomp_cmd, "-f", str(comp_dest)])
+        else:
+            # Remote decompression
+            if compressor == "zstd":
+                remote_cmd = f"""
 set -euo pipefail
 if command -v unzstd >/dev/null 2>&1; then
   unzstd -T0 -f --rm {shlex.quote(comp_dest)}
@@ -574,12 +579,12 @@ else
   rm -f {shlex.quote(comp_dest)}
 fi
 """
-        else:  # pigz/gzip
-            remote_cmd = f"""
+            else:  # pigz/gzip
+                remote_cmd = f"""
 set -euo pipefail
 gunzip -f {shlex.quote(comp_dest)} || gzip -d -f {shlex.quote(comp_dest)}
 """
-        run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
+            run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
 
     if not args.keep_local_artifact:
         try:
@@ -852,24 +857,51 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
     rsync_comp_level = args.rsync_compress_level if hasattr(args, 'rsync_compress_level') else 1
     rsync_many_parallel(parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout, use_rsync_compress, rsync_comp_level)
 
-    eprint(f"[chunked] Reassembling file on destination...")
+    # Reassemble file on destination
     stage_q = shlex.quote(stage_dir)
     dest_q = shlex.quote(dest_file)
     if args.compress_chunks:
         compressor = args.compressor
         _, decomp_cmd, ext = get_compressor_cmd(compressor) or (None, None, None)
         
-        if compressor == "zstd":
-            decomp_cmd_str = "zstd -d -c"
-            pattern = "part.*.zst"
-        elif compressor in ("pigz", "gzip"):
-            decomp_cmd_str = "gunzip -c || gzip -d -c"
-            pattern = "part.*.gz"
+        if args.keep_compressed:
+            # Keep compressed chunks and concatenate them
+            eprint(f"[chunked] Keeping compressed chunks and concatenating to {dest_q}{ext}...")
+            if compressor == "zstd":
+                pattern = "part.*.zst"
+            elif compressor in ("pigz", "gzip"):
+                pattern = "part.*.gz"
+            else:
+                pattern = f"part.*{ext}"
+            
+            assemble_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={dest_q}{ext}
+tmp="${{dest}}.incomplete.$$"
+: > "$tmp"
+for f in $(ls -1 {pattern} | sort); do
+  cat "$f" >> "$tmp"
+  rm -f "$f"
+done
+mv -f "$tmp" "$dest"
+cd /
+rmdir {stage_q} || true
+"""
         else:
-            decomp_cmd_str = f"{decomp_cmd} -d -c"
-            pattern = f"part.*{ext}"
-        
-        assemble_cmd = f"""
+            # Decompress and reassemble
+            eprint(f"[chunked] Reassembling and decompressing file on destination...")
+            if compressor == "zstd":
+                decomp_cmd_str = "zstd -d -c"
+                pattern = "part.*.zst"
+            elif compressor in ("pigz", "gzip"):
+                decomp_cmd_str = "gunzip -c || gzip -d -c"
+                pattern = "part.*.gz"
+            else:
+                decomp_cmd_str = f"{decomp_cmd} -d -c"
+                pattern = f"part.*{ext}"
+            
+            assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -962,6 +994,7 @@ def main() -> int:
     p.add_argument("--compression-level", type=int, default=6, help="Compression level (1=fast, 6=default for pigz/gzip, 3=default for zstd)")
     p.add_argument("--compression-threads", type=int, default=0, help="Threads for compression (0=auto, pigz only)")
     p.add_argument("--keep-local-artifact", action="store_true", help="Keep local compressed artifact for compress strategy")
+    p.add_argument("--keep-compressed", action="store_true", help="Keep compressed file on destination (skip decompression)")
     p.add_argument("--chunk-size", default="20G", help="Chunk size for chunked strategy (e.g., 4G, 20G, 500M). Optimal: 5-20G for 10G links, 10-50G for 25G+, smaller for slower links")
     p.add_argument("--parallel", type=int, default=1, help="Parallel transfers for chunked strategy")
     p.add_argument("--compress-chunks", action="store_true", help="In chunked mode, compress each chunk before transfer")
