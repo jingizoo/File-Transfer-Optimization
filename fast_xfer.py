@@ -604,26 +604,61 @@ def rsync_many_parallel(
 
     eprint(f"[chunked] Transferring {len(files)} files in parallel (workers={parallel})...")
 
-    def send_one(p: Path) -> None:
+    def send_one(p: Path) -> tuple[Path, bool, Optional[str]]:
+        """Returns (file_path, success, error_message)"""
         cmd = [
             "rsync",
-            "-rtvh",
+            "-rtv",  # Removed -h and --info=progress2 to reduce output
             "--partial",
             "--protect-args",
             f"--timeout={rsync_timeout}",
             "--whole-file",
+            "--info=name0",  # Minimal output: only show file names, no progress
         ]
         if ssh_e:
             cmd.extend(["-e", ssh_e])
         cmd.extend([str(p), dest_dir_str])
-        run_stream(cmd)
+        
+        try:
+            # Run without streaming to avoid blocking - capture output instead
+            # This allows true parallel execution
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,  # Suppress output for parallel transfers
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            return (p, True, None)
+        except subprocess.CalledProcessError as e:
+            error_msg = f"{e.stderr.decode('utf-8', errors='ignore') if isinstance(e.stderr, bytes) else e.stderr or 'unknown error'}"
+            return (p, False, error_msg)
 
+    # Run transfers in parallel
+    completed = 0
+    failed = []
+    total = len(files)
+    eprint(f"[chunked] Starting parallel transfer of {total} files with {parallel} workers...")
+    
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
-        futs = [ex.submit(send_one, f) for f in files]
+        futs = {ex.submit(send_one, f): f for f in files}
         for fut in as_completed(futs):
-            fut.result()
+            file_path, success, error = fut.result()
+            completed += 1
+            if not success:
+                failed.append((file_path, error))
+            # Show progress every 10% or on completion
+            if completed % max(1, total // 10) == 0 or completed == total:
+                eprint(f"[chunked] Progress: {completed}/{total} files transferred")
 
-    eprint(f"[chunked] All parts transferred")
+    if failed:
+        eprint(f"[chunked] ERROR: Failed to transfer {len(failed)}/{total} files:")
+        for fpath, err in failed[:5]:  # Show first 5 errors
+            eprint(f"  - {fpath.name}: {err}")
+        if len(failed) > 5:
+            eprint(f"  ... and {len(failed) - 5} more failures")
+        raise RuntimeError(f"Failed to transfer {len(failed)} files")
+
+    eprint(f"[chunked] ✓ All {total} parts transferred successfully")
 
 
 def local_mkdir_p(directory: str) -> None:
@@ -639,7 +674,9 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         tmpdir.mkdir(parents=True, exist_ok=True)
         cleanup_tmpdir = args.cleanup_workdir
     else:
-        tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_{src.name}_"))
+        # Use user-specified temp dir or system default (respects TMPDIR env var)
+        temp_base = args.temp_dir if hasattr(args, 'temp_dir') and args.temp_dir else tempfile.gettempdir()
+        tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_{src.name}_", dir=temp_base))
         cleanup_tmpdir = True
 
     part_prefix = tmpdir / "part."
@@ -798,6 +835,7 @@ def main() -> int:
     p.add_argument("--auto-threshold", type=float, default=0.85, help="Auto mode: choose compress if compression(out/in) <= threshold")
     p.add_argument("--skip-estimate", action="store_true", help="Skip compression estimation in auto mode (use direct transfer)")
     p.add_argument("--estimate-timeout", type=int, default=30, help="Timeout in seconds for compression estimation (default: 30)")
+    p.add_argument("--temp-dir", default=None, help="Temporary directory for SSH control sockets (default: system temp, respects TMPDIR env var)")
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
 
     args = p.parse_args()
@@ -833,7 +871,9 @@ def main() -> int:
         if which("ssh") is None:
             eprint("ERROR: requires ssh installed for remote transfers.")
             return 2
-        control_path = f"/tmp/sshcm-{os.getpid()}-%r@%h:%p"
+        # Use user-specified temp dir or system default (respects TMPDIR env var)
+        temp_base = args.temp_dir if hasattr(args, 'temp_dir') and args.temp_dir else tempfile.gettempdir()
+        control_path = os.path.join(temp_base, f"sshcm-{os.getpid()}-%r@%h:%p")
         cipher = pick_ssh_cipher(user, host, args.connect_timeout, control_path)
         ssh_e = ssh_cmd_str(args.connect_timeout, cipher, control_path)
         remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, dest_dir)

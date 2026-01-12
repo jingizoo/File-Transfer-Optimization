@@ -139,3 +139,13 @@ fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
 echo "Example 20: Direct transfer (no compression, no estimation)"
 fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
   --strategy direct
+
+# Example 21: Custom temp directory (instead of /tmp)
+echo "Example 21: Using custom temp directory"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
+  --temp-dir /var/tmp
+
+# Example 22: Using TMPDIR environment variable
+echo "Example 22: Temp dir via TMPDIR env var (set before running)"
+# export TMPDIR=/custom/temp
+# fast-xfer /data/file.txt user@10.0.0.15:/data/replica/
