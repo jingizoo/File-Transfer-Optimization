@@ -353,6 +353,8 @@ def build_rsync_cmd(
     inplace: bool,
     preallocate: bool,
     timeout: int,
+    rsync_compress: bool = False,
+    rsync_compress_level: int = 1,
 ) -> list[str]:
     cmd: list[str] = [
         "rsync",
@@ -364,6 +366,12 @@ def build_rsync_cmd(
     ]
     if ssh_e:
         cmd.extend(["-e", ssh_e])
+    if rsync_compress:
+        # Use rsync's built-in compression (compresses on-the-fly during transfer)
+        # This is more efficient than pre-compression for network transfers
+        cmd.append("--compress")
+        if rsync_compress_level > 0:
+            cmd.append(f"--compress-level={rsync_compress_level}")
     if inplace:
         cmd.append("--inplace")
     if preallocate:
@@ -410,6 +418,9 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
         eprint(f"[local] Copy completed in {copy_elapsed:.1f}s ({human_bytes(copy_speed)}/s)")
     else:
         dest = f"{user}@{host}:{dest_file}"
+        # Use rsync compression for remote transfers if enabled
+        use_rsync_compress = args.rsync_compress if hasattr(args, 'rsync_compress') else False
+        rsync_comp_level = args.rsync_compress_level if hasattr(args, 'rsync_compress_level') else 1
         cmd = build_rsync_cmd(
             str(args.source),
             dest,
@@ -419,7 +430,11 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
             inplace=args.inplace,
             preallocate=args.preallocate,
             timeout=args.rsync_timeout,
+            rsync_compress=use_rsync_compress,
+            rsync_compress_level=rsync_comp_level,
         )
+        if use_rsync_compress:
+            eprint(f"[direct] Using rsync built-in compression (level {rsync_comp_level}) for on-the-fly compression")
         run_stream(cmd)
 
 
@@ -477,7 +492,13 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
         
         # pigz -c reads from stdin and outputs to stdout
         with open(src, "rb") as infile, open(comp_local, "wb") as outfile:
-            subprocess.run(cmd, stdin=infile, stdout=outfile, check=True, stderr=subprocess.PIPE)
+            result = subprocess.run(cmd, stdin=infile, stdout=outfile, stderr=subprocess.PIPE, check=False)
+            if result.returncode != 0:
+                error_msg = result.stderr.decode('utf-8', errors='ignore') if result.stderr else "unknown error"
+                raise RuntimeError(f"pigz compression failed (exit={result.returncode}): {error_msg}")
+            # Verify compression actually happened
+            if comp_local.exists() and comp_local.stat().st_size == 0:
+                raise RuntimeError("pigz produced empty output - compression may have failed")
     elif compressor == "gzip":
         cmd = [comp_cmd, f"-{comp_level}", "-c", str(src)]
         # gzip -c outputs to stdout
@@ -489,6 +510,14 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
     comp_ratio = comp_size / src_size if src_size > 0 else 0
     comp_speed = src_size / comp_elapsed if comp_elapsed > 0 else 0
     eprint(f"[compress] Compressed: {human_bytes(src_size)} -> {human_bytes(comp_size)} ({comp_ratio:.1%}) in {comp_elapsed:.1f}s ({human_bytes(comp_speed)}/s)")
+    
+    # Warn if compression didn't help much
+    if comp_ratio >= 0.95:
+        eprint(f"[compress] WARNING: Compression ratio is {comp_ratio:.1%} - file may already be compressed or incompressible")
+        eprint(f"[compress] Suggestion: Use --strategy direct for better performance on incompressible files")
+    elif comp_ratio > 1.0:
+        eprint(f"[compress] WARNING: Compressed file is LARGER than original ({comp_ratio:.1%})!")
+        eprint(f"[compress] This file does not compress well. Consider using --strategy direct instead")
 
     comp_size = comp_local.stat().st_size
     eprint(f"[compress] Transferring compressed file ({human_bytes(comp_size)})...")
@@ -633,6 +662,8 @@ def rsync_many_parallel(
     ssh_e: Optional[str],
     parallel: int,
     rsync_timeout: int,
+    rsync_compress: bool = False,
+    rsync_compress_level: int = 1,
 ) -> None:
     if is_local:
         # For local transfers, use fast parallel copy (faster than rsync)
@@ -713,6 +744,11 @@ def rsync_many_parallel(
             "--whole-file",
             "--info=name0",  # Minimal output: only show file names, no progress
         ]
+        # Add rsync compression if enabled (for uncompressed files only)
+        if rsync_compress and not str(p).endswith(('.gz', '.zst', '.bz2', '.xz', '.zip')):
+            # Only compress if file doesn't appear to be already compressed
+            cmd.append("--compress")
+            cmd.append(f"--compress-level={rsync_compress_level}")
         if ssh_e:
             cmd.extend(["-e", ssh_e])
         cmd.extend([str(p), dest_dir_str])
@@ -811,7 +847,10 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
         remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, stage_dir)
 
-    rsync_many_parallel(parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout)
+    # Use rsync compression for chunked transfers if enabled (only for uncompressed files)
+    use_rsync_compress = args.rsync_compress if hasattr(args, 'rsync_compress') and not args.compress_chunks else False
+    rsync_comp_level = args.rsync_compress_level if hasattr(args, 'rsync_compress_level') else 1
+    rsync_many_parallel(parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout, use_rsync_compress, rsync_comp_level)
 
     eprint(f"[chunked] Reassembling file on destination...")
     stage_q = shlex.quote(stage_dir)
@@ -934,6 +973,8 @@ def main() -> int:
     p.add_argument("--skip-estimate", action="store_true", help="Skip compression estimation in auto mode (use direct transfer)")
     p.add_argument("--estimate-timeout", type=int, default=30, help="Timeout in seconds for compression estimation (default: 30)")
     p.add_argument("--temp-dir", default=None, help="Temporary directory for SSH control sockets (default: system temp, respects TMPDIR env var)")
+    p.add_argument("--rsync-compress", action="store_true", help="Use rsync's built-in compression (compresses on-the-fly during transfer, more efficient than pre-compression)")
+    p.add_argument("--rsync-compress-level", type=int, default=1, help="rsync compression level (1=fast, 6=better ratio, default: 1)")
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
 
     args = p.parse_args()
