@@ -395,20 +395,32 @@ def normalize_dest_path(target_path: str, src_file: Path) -> Tuple[str, str]:
 
 def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str]) -> None:
     if is_local:
-        dest = dest_file
+        # For local transfers, ALWAYS use direct copy (faster than rsync)
+        src = Path(args.source).resolve()
+        dest = Path(dest_file)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        
+        src_size = src.stat().st_size
+        eprint(f"[local] Copying {src.name} ({human_bytes(src_size)})...")
+        copy_start = time.time()
+        import shutil
+        shutil.copy2(str(src), str(dest))  # copy2 preserves metadata (like cp -p)
+        copy_elapsed = time.time() - copy_start
+        copy_speed = src_size / copy_elapsed if copy_elapsed > 0 else 0
+        eprint(f"[local] Copy completed in {copy_elapsed:.1f}s ({human_bytes(copy_speed)}/s)")
     else:
         dest = f"{user}@{host}:{dest_file}"
-    cmd = build_rsync_cmd(
-        str(args.source),
-        dest,
-        ssh_e,
-        append_only=args.append_only,
-        whole_file=args.whole_file,
-        inplace=args.inplace,
-        preallocate=args.preallocate,
-        timeout=args.rsync_timeout,
-    )
-    run_stream(cmd)
+        cmd = build_rsync_cmd(
+            str(args.source),
+            dest,
+            ssh_e,
+            append_only=args.append_only,
+            whole_file=args.whole_file,
+            inplace=args.inplace,
+            preallocate=args.preallocate,
+            timeout=args.rsync_timeout,
+        )
+        run_stream(cmd)
 
 
 def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
@@ -441,19 +453,28 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
 
     # Build compression command
     comp_level = args.compression_level
-    eprint(f"[compress] Compressing {src.name} with {compressor} level {comp_level}...")
+    src_size = src.stat().st_size
+    eprint(f"[compress] Compressing {src.name} ({human_bytes(src_size)}) with {compressor} level {comp_level}...")
+    comp_start = time.time()
     
     if compressor == "zstd":
         cmd = [comp_cmd, f"-{comp_level}", "-T0", "--no-progress", "-o", str(comp_local), str(src)]
         run_stream(cmd)
     elif compressor == "pigz":
-        threads = args.compression_threads if hasattr(args, 'compression_threads') else 0
+        threads = args.compression_threads if hasattr(args, 'compression_threads') and args.compression_threads > 0 else 0
+        # Auto-detect threads if not specified (use CPU count)
+        if threads == 0:
+            try:
+                import multiprocessing
+                threads = multiprocessing.cpu_count()
+            except:
+                threads = 4  # fallback
+        
         # pigz: when using -c, it reads from stdin, so we need to redirect input
         # Build command: pigz -9 [-p N] -c
-        if threads > 0:
-            cmd = [comp_cmd, f"-{comp_level}", "-p", str(threads), "-c"]
-        else:
-            cmd = [comp_cmd, f"-{comp_level}", "-c"]
+        cmd = [comp_cmd, f"-{comp_level}", "-p", str(threads), "-c"]
+        eprint(f"[compress] Using {threads} threads for pigz compression...")
+        
         # pigz -c reads from stdin and outputs to stdout
         with open(src, "rb") as infile, open(comp_local, "wb") as outfile:
             subprocess.run(cmd, stdin=infile, stdout=outfile, check=True, stderr=subprocess.PIPE)
@@ -462,25 +483,41 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
         # gzip -c outputs to stdout
         with open(comp_local, "wb") as out:
             subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
-    else:
-        raise RuntimeError(f"Unknown compressor: {compressor}")
+    
+    comp_elapsed = time.time() - comp_start
+    comp_size = comp_local.stat().st_size
+    comp_ratio = comp_size / src_size if src_size > 0 else 0
+    comp_speed = src_size / comp_elapsed if comp_elapsed > 0 else 0
+    eprint(f"[compress] Compressed: {human_bytes(src_size)} -> {human_bytes(comp_size)} ({comp_ratio:.1%}) in {comp_elapsed:.1f}s ({human_bytes(comp_speed)}/s)")
 
-    eprint(f"[compress] Transferring compressed file...")
+    comp_size = comp_local.stat().st_size
+    eprint(f"[compress] Transferring compressed file ({human_bytes(comp_size)})...")
+    transfer_start = time.time()
     if is_local:
-        dest = comp_dest
+        # For local, use fast copy (faster than rsync)
+        dest_path = Path(comp_dest)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(str(comp_local), str(dest_path))
+        transfer_elapsed = time.time() - transfer_start
+        transfer_speed = comp_size / transfer_elapsed if transfer_elapsed > 0 else 0
+        eprint(f"[compress] Transfer completed in {transfer_elapsed:.1f}s ({human_bytes(transfer_speed)}/s)")
     else:
         dest = f"{user}@{host}:{comp_dest}"
-    cmd = build_rsync_cmd(
-        str(comp_local),
-        dest,
-        ssh_e,
-        append_only=False,
-        whole_file=True,
-        inplace=False,
-        preallocate=args.preallocate,
-        timeout=args.rsync_timeout,
-    )
-    run_stream(cmd)
+        cmd = build_rsync_cmd(
+            str(comp_local),
+            dest,
+            ssh_e,
+            append_only=False,
+            whole_file=True,
+            inplace=False,
+            preallocate=args.preallocate,
+            timeout=args.rsync_timeout,
+        )
+        run_stream(cmd)
+        transfer_elapsed = time.time() - transfer_start
+        transfer_speed = comp_size / transfer_elapsed if transfer_elapsed > 0 else 0
+        eprint(f"[compress] Transfer completed in {transfer_elapsed:.1f}s ({human_bytes(transfer_speed)}/s)")
 
     eprint(f"[compress] Decompressing on destination...")
     if is_local:
@@ -598,9 +635,70 @@ def rsync_many_parallel(
     rsync_timeout: int,
 ) -> None:
     if is_local:
-        dest_dir_str = f"{dest_dir.rstrip('/')}/"
-    else:
-        dest_dir_str = f"{user}@{host}:{dest_dir.rstrip('/')}/"
+        # For local transfers, use fast parallel copy (faster than rsync)
+        dest_path = Path(dest_dir)
+        dest_path.mkdir(parents=True, exist_ok=True)
+        
+        eprint(f"[chunked] Copying {len(files)} files in parallel (workers={parallel})...")
+        
+        def copy_one(p: Path) -> tuple[Path, bool, Optional[str]]:
+            """Returns (file_path, success, error_message)"""
+            try:
+                dest_file = dest_path / p.name
+                import shutil
+                shutil.copy2(str(p), str(dest_file))
+                return (p, True, None)
+            except Exception as e:
+                return (p, False, str(e))
+        
+        # Run copies in parallel
+        completed = 0
+        failed = []
+        total = len(files)
+        total_size = sum(f.stat().st_size for f in files)
+        transfer_start = time.time()
+        eprint(f"[chunked] Starting parallel copy of {total} files ({human_bytes(total_size)}) with {parallel} workers...")
+        
+        with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
+            futs = {ex.submit(copy_one, f): f for f in files}
+            for fut in as_completed(futs):
+                file_path, success, error = fut.result()
+                completed += 1
+                if not success:
+                    failed.append((file_path, error))
+                
+                # Show progress with speed
+                elapsed = time.time() - transfer_start
+                if elapsed > 0:
+                    transferred_so_far = sum(f.stat().st_size for f in files[:completed])
+                    current_speed = transferred_so_far / elapsed
+                    remaining = total - completed
+                    if remaining > 0:
+                        avg_file_size = total_size / total
+                        eta = (remaining * avg_file_size) / current_speed if current_speed > 0 else 0
+                        eprint(f"[chunked] Progress: {completed}/{total} files ({human_bytes(transferred_so_far)}/{human_bytes(total_size)}) - {human_bytes(current_speed)}/s - ETA: {eta:.0f}s")
+                    else:
+                        eprint(f"[chunked] Progress: {completed}/{total} files ({human_bytes(transferred_so_far)}/{human_bytes(total_size)}) - {human_bytes(current_speed)}/s")
+                else:
+                    if completed % max(1, total // 10) == 0 or completed == total:
+                        eprint(f"[chunked] Progress: {completed}/{total} files transferred")
+        
+        transfer_elapsed = time.time() - transfer_start
+        transfer_speed = total_size / transfer_elapsed if transfer_elapsed > 0 else 0
+        
+        if failed:
+            eprint(f"[chunked] ERROR: Failed to copy {len(failed)}/{total} files:")
+            for fpath, err in failed[:5]:
+                eprint(f"  - {fpath.name}: {err}")
+            if len(failed) > 5:
+                eprint(f"  ... and {len(failed) - 5} more failures")
+            raise RuntimeError(f"Failed to copy {len(failed)} files")
+        
+        eprint(f"[chunked] ✓ All {total} parts copied successfully in {transfer_elapsed:.1f}s ({human_bytes(transfer_speed)}/s)")
+        return
+        
+    # Remote transfer path (original rsync code)
+    dest_dir_str = f"{user}@{host}:{dest_dir.rstrip('/')}/"
 
     eprint(f"[chunked] Transferring {len(files)} files in parallel (workers={parallel})...")
 
