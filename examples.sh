@@ -149,3 +149,9 @@ fast-xfer /data/file.txt user@10.0.0.15:/data/replica/ \
 echo "Example 22: Temp dir via TMPDIR env var (set before running)"
 # export TMPDIR=/custom/temp
 # fast-xfer /data/file.txt user@10.0.0.15:/data/replica/
+fast-xfer hugefile.dat user@host:/dest/ \
+  --strategy chunked \
+  --chunk-size 10G \
+  --parallel 4 \
+  --rsync-compress \
+  --rsync-compress-level 1
