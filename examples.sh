@@ -190,3 +190,13 @@ fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --compressor pigz \
   --compression-level 6 \
   --keep-compressed
+
+# Example 35: BEST - Chunked + Compress (FASTEST for large files with good compression)
+  --strategy chunked \
+  --chunk-size 5G \
+  --parallel 4 \
+  --compress-chunks \
+  --compressor pigz \
+  --compression-level 6 \
+  --keep-compressed \
+  --cleanup-local-parts
