@@ -580,12 +580,48 @@ def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Opt
     # Close compression stdout in parent (SSH process owns it now)
     comp_proc.stdout.close()
     
-    # Wait for both processes
-    comp_stderr = comp_proc.stderr.read()
-    ssh_stdout, ssh_stderr = ssh_proc.communicate()
+    # Monitor progress by reading from compression stderr (if available) and tracking time
+    # For progress display, we'll show periodic updates based on elapsed time
+    last_progress_time = transfer_start
+    progress_interval = 2.0  # Show progress every 2 seconds
     
+    # Read compression stderr in background (for error reporting)
+    comp_stderr_chunks = []
+    def read_comp_stderr():
+        if comp_proc.stderr:
+            try:
+                while True:
+                    chunk = comp_proc.stderr.read(1024)
+                    if not chunk:
+                        break
+                    comp_stderr_chunks.append(chunk)
+            except Exception:
+                pass
+    
+    import threading
+    stderr_thread = threading.Thread(target=read_comp_stderr, daemon=True)
+    stderr_thread.start()
+    
+    # Monitor SSH process and show progress
+    while ssh_proc.poll() is None:
+        elapsed = time.time() - transfer_start
+        if elapsed - (last_progress_time - transfer_start) >= progress_interval:
+            # Estimate progress based on time (rough estimate)
+            # We can't know exact bytes transferred through pipe, so estimate based on elapsed time
+            estimated_speed = src_size / elapsed if elapsed > 0 else 0
+            estimated_progress = min(100, (elapsed / (src_size / estimated_speed * 0.1)) * 100) if estimated_speed > 0 else 0
+            eprint(f"[stream] Transferring... {elapsed:.1f}s elapsed (~{estimated_progress:.0f}% estimated, ~{human_bytes(estimated_speed)}/s)", end='\r')
+            last_progress_time = time.time()
+        time.sleep(0.5)
+    
+    # Wait for both processes
+    ssh_stdout, ssh_stderr = ssh_proc.communicate()
     comp_retcode = comp_proc.wait()
     ssh_retcode = ssh_proc.returncode
+    
+    # Join stderr thread
+    stderr_thread.join(timeout=1.0)
+    comp_stderr = b''.join(comp_stderr_chunks)
     
     if comp_retcode != 0:
         error_msg = comp_stderr.decode('utf-8', errors='ignore') if comp_stderr else "unknown error"
@@ -596,9 +632,9 @@ def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Opt
         raise RuntimeError(f"Transfer failed (exit={ssh_retcode}): {error_msg}")
     
     transfer_elapsed = time.time() - transfer_start
-    # Estimate compressed size (use ratio from previous runs or assume similar)
-    # For now, we'll just show transfer time
-    eprint(f"[stream] Transfer completed in {transfer_elapsed:.1f}s")
+    transfer_speed = src_size / transfer_elapsed if transfer_elapsed > 0 else 0
+    eprint()  # New line after progress
+    eprint(f"[stream] Transfer completed in {transfer_elapsed:.1f}s ({human_bytes(transfer_speed)}/s)")
     
     if args.keep_compressed:
         eprint(f"[stream] Compressed file saved: {dest_file}{ext}")
