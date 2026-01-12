@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -77,18 +79,60 @@ def run_stream(cmd: list[str], *, env: Optional[dict[str, str]] = None) -> None:
 TARGET_RE = re.compile(r"^(?:(?P<user>[^@]+)@)?(?P<host>[^:]+):(?P<path>.+)$")
 
 
-def parse_target(target: str, default_user: Optional[str]) -> Tuple[bool, Optional[str], Optional[str], str]:
+def get_nfs_info(path: str) -> Optional[Tuple[str, str]]:
+    """
+    Detect if a path is on an NFS mount and return (server, export_path).
+    Returns None if not NFS or detection fails.
+    """
+    try:
+        # Use findmnt to get mount info (more reliable than /proc/mounts)
+        # findmnt -n -o SOURCE,TARGET <path> returns: server:/export /mount/point
+        result = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE,TARGET", path],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout:
+            parts = result.stdout.strip().split()
+            if len(parts) >= 2:
+                source = parts[0]
+                # Check if it's NFS (starts with server: or server:/)
+                if ":" in source and not source.startswith("/"):
+                    # Extract server and export path
+                    if "/" in source:
+                        server, export_path = source.split("/", 1)
+                        export_path = "/" + export_path
+                    else:
+                        server = source.rstrip(":")
+                        export_path = "/"
+                    return (server, export_path)
+    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def parse_target(target: str, default_user: Optional[str], nfs_server: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[str], str]:
     """
     Parse target like:
       user@10.0.0.15:/data/path  (remote)
       10.0.0.15:/data/path        (remote)
-      /data/path                  (local)
+      /data/path                  (local, unless nfs_server is set)
     Returns (is_local, user, host, path).
+    
+    If nfs_server is provided and target is a local path, treat it as remote via NFS server.
     """
     target = target.strip()
     
     # Check if it's a local path (absolute path without user@host: prefix)
     if target.startswith("/") and ":" not in target:
+        # If nfs_server is specified, treat as remote via NFS
+        if nfs_server:
+            user = default_user or os.getenv("USER") or ""
+            if not user:
+                raise ValueError("Could not determine ssh user for NFS streaming; set --user or --nfs-user")
+            return False, user, nfs_server, target
+        
         # Local path - no user, no host
         return True, None, None, target
     
@@ -343,6 +387,125 @@ def human_bytes(n: int) -> str:
     return f"{n}B"
 
 
+def parse_size_to_bytes(size: str) -> int:
+    """
+    Parse human size strings similar to coreutils (split/dd).
+    Supports: 123, 10K, 10M, 10G, 10T, 10P, 10E, and SI forms like 10kB/MB/GB, and IEC like 10KiB/MiB/GiB.
+    Returns integer bytes.
+    """
+    s = size.strip()
+    if not s:
+        raise ValueError("size is empty")
+
+    # Split number and suffix
+    m = re.fullmatch(r"(?P<num>\d+)(?P<suf>[A-Za-z]{0,3})", s)
+    if not m:
+        raise ValueError(f"invalid size: {size!r} (examples: 500M, 20G, 4GiB)")
+
+    num = int(m.group("num"))
+    suf = m.group("suf") or ""
+
+    multipliers = {
+        "": 1,
+        "c": 1,
+        "w": 2,
+        "b": 512,
+
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+        "P": 1024**5,
+        "E": 1024**6,
+
+        "kB": 1000,
+        "MB": 1000**2,
+        "GB": 1000**3,
+        "TB": 1000**4,
+        "PB": 1000**5,
+        "EB": 1000**6,
+
+        "KiB": 1024,
+        "MiB": 1024**2,
+        "GiB": 1024**3,
+        "TiB": 1024**4,
+        "PiB": 1024**5,
+        "EiB": 1024**6,
+    }
+    if suf not in multipliers:
+        raise ValueError(f"invalid size suffix: {suf!r} (examples: K, M, G, kB, MiB)")
+
+    return num * multipliers[suf]
+
+
+def choose_block_size(chunk_bytes: int, *, max_bs: int = 16 * 1024 * 1024) -> int:
+    """
+    Pick a dd-friendly block size (bytes) that divides chunk_bytes.
+    Larger bs reduces dd overhead. Caps at max_bs.
+    """
+    if chunk_bytes <= 0:
+        return 1024 * 1024
+
+    # Candidate sizes (bytes), descending.
+    cands = [
+        128 * 1024 * 1024,
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        16 * 1024 * 1024,
+        8 * 1024 * 1024,
+        4 * 1024 * 1024,
+        2 * 1024 * 1024,
+        1024 * 1024,
+        512 * 1024,
+        256 * 1024,
+        128 * 1024,
+        64 * 1024,
+        32 * 1024,
+        16 * 1024,
+        8 * 1024,
+        4 * 1024,
+        1024,
+        512,
+    ]
+    for bs in cands:
+        if bs > max_bs:
+            continue
+        if chunk_bytes % bs == 0:
+            return bs
+    return 1024 * 1024  # fallback
+
+
+def local_cpu_count() -> int:
+    try:
+        import multiprocessing
+        return multiprocessing.cpu_count()
+    except Exception:
+        return 4
+
+
+def remote_capture(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str], cmd: str) -> str:
+    full = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", cmd]
+    p = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"remote command failed: {cmd}\n{p.stderr.strip()}")
+    return (p.stdout or "").strip()
+
+
+def remote_fs_type(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str], path: str) -> str:
+    # %T is filesystem type (e.g., ext4, xfs, nfs)
+    cmd = f"stat -f -c %T {shlex.quote(path)} 2>/dev/null || echo unknown"
+    return remote_capture(user, host, connect_timeout, cipher, control_path, cmd)
+
+
+def remote_cpu(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str]) -> int:
+    cmd = "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4"
+    out = remote_capture(user, host, connect_timeout, cipher, control_path, cmd)
+    try:
+        return max(1, int(out.strip()))
+    except Exception:
+        return 4
+
+
 def get_decompression_threads(requested: Optional[int]) -> int:
     """
     Get optimal number of threads for decompression.
@@ -492,10 +655,50 @@ def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Opt
     comp_cmd, decomp_cmd, ext = comp_info
     
     if is_local:
-        # For local, streaming doesn't make sense - just use regular compress
-        eprint("[stream] Local transfer detected - using regular compress strategy instead")
-        strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
-        return
+        # Check if this is an NFS mount that we should stream via SSH
+        nfs_info = get_nfs_info(dest_file)
+        nfs_server = getattr(args, 'nfs_server', None)
+        
+        if nfs_info or nfs_server:
+            # NFS mount detected or explicitly specified - use SSH streaming to NFS server
+            if nfs_server:
+                nfs_host = nfs_server
+                eprint(f"[stream] NFS streaming mode: using specified NFS server {nfs_host}")
+            elif nfs_info:
+                nfs_host, _ = nfs_info
+                eprint(f"[stream] NFS mount detected: streaming via NFS server {nfs_host}")
+            else:
+                # Fall back to regular compress
+                eprint("[stream] Local transfer detected - using regular compress strategy instead")
+                strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+                return
+            
+            # Override is_local and set up SSH for NFS streaming
+            is_local = False
+            if not user:
+                user = args.user or os.getenv("USER") or ""
+                if not user:
+                    raise ValueError("Could not determine ssh user for NFS streaming; set --user or --nfs-user")
+            
+            # Set up SSH if not already done
+            if not ssh_e or not control_path or not cipher:
+                if which("ssh") is None:
+                    raise RuntimeError("SSH required for NFS streaming")
+                temp_base = args.temp_dir if hasattr(args, 'temp_dir') and args.temp_dir else tempfile.gettempdir()
+                control_path = os.path.join(temp_base, f"sshcm-{os.getpid()}-%r@%h:%p")
+                cipher = pick_ssh_cipher(user, nfs_host, args.connect_timeout, control_path)
+                ssh_e = ssh_cmd_str(args.connect_timeout, cipher, control_path)
+            
+            host = nfs_host
+            
+            # Ensure remote directory exists
+            dest_dir = str(Path(dest_file).parent)
+            remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, dest_dir)
+        else:
+            # Regular local transfer - use compress strategy
+            eprint("[stream] Local transfer detected - using regular compress strategy instead")
+            strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+            return
     
     assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
     
@@ -979,11 +1182,13 @@ def rsync_many_parallel(
             error_msg = f"{e.stderr.decode('utf-8', errors='ignore') if isinstance(e.stderr, bytes) else e.stderr or 'unknown error'}"
             return (p, False, error_msg)
 
-    # Run transfers in parallel
+    # Run transfers in parallel with better progress reporting
     completed = 0
     failed = []
     total = len(files)
-    eprint(f"[chunked] Starting parallel transfer of {total} files with {parallel} workers...")
+    total_size = sum(f.stat().st_size for f in files)
+    transfer_start = time.time()
+    eprint(f"[chunked] Starting parallel transfer of {total} files ({human_bytes(total_size)}) with {parallel} workers...")
     
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
         futs = {ex.submit(send_one, f): f for f in files}
@@ -992,9 +1197,20 @@ def rsync_many_parallel(
             completed += 1
             if not success:
                 failed.append((file_path, error))
-            # Show progress every 10% or on completion
-            if completed % max(1, total // 10) == 0 or completed == total:
-                eprint(f"[chunked] Progress: {completed}/{total} files transferred")
+            
+            # Show progress with percentage and speed (similar to zstd_xfer_turbo.py)
+            elapsed = time.time() - transfer_start
+            if elapsed > 0:
+                # Estimate transferred bytes (rough, based on completed files)
+                transferred_so_far = sum(f.stat().st_size for f in files[:completed]) if completed <= len(files) else total_size
+                current_speed = transferred_so_far / elapsed
+                pct = min(100.0, (completed / total) * 100.0)
+                eprint(f"[chunked] Progress: {pct:6.2f}%  {completed}/{total} files  {human_bytes(transferred_so_far)}/{human_bytes(total_size)}  avg={human_bytes(current_speed)}/s", end='\r')
+            else:
+                if completed % max(1, total // 10) == 0 or completed == total:
+                    eprint(f"[chunked] Progress: {completed}/{total} files transferred")
+    
+    eprint()  # New line after progress
 
     if failed:
         eprint(f"[chunked] ERROR: Failed to transfer {len(failed)}/{total} files:")
@@ -1049,6 +1265,13 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             
             if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
                 raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+            
+            # For zstd turbo mode (dd-based assembly), also check for dd and xargs
+            if compressor == "zstd" and not args.keep_compressed:
+                if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd"):
+                    eprint(f"[chunked] WARNING: 'dd' not found on remote - turbo mode (dd-based assembly) will be disabled")
+                if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs"):
+                    eprint(f"[chunked] WARNING: 'xargs' not found on remote - turbo mode (dd-based assembly) will be disabled")
         
         parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts)
 
@@ -1096,25 +1319,127 @@ cd /
 rmdir {stage_q} || true
 """
         else:
-            # Decompress and reassemble - OPTIMIZED: parallel decompression + faster concatenation
+            # Decompress and reassemble - OPTIMIZED: use dd-based assembly for zstd (writes directly to final file offsets)
             eprint(f"[chunked] Reassembling and decompressing file on destination (optimized)...")
             decomp_threads = get_decompression_threads(getattr(args, 'decompression_threads', None))
             eprint(f"[chunked] Using {decomp_threads} threads per chunk for parallel decompression")
             
-            if compressor == "zstd":
-                # zstd: use fast mode and all threads for each chunk
-                decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
-                pattern = "part.*.zst"
-            elif compressor in ("pigz", "gzip"):
-                # pigz: use all threads for parallel decompression
-                decomp_cmd_str = f"pigz -d -c -p {decomp_threads} 2>/dev/null || gunzip -c || gzip -d -c"
-                pattern = "part.*.gz"
+            if compressor == "zstd" and not is_local:
+                # Check if remote has dd and xargs for turbo mode
+                has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
+                has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
+                
+                if has_dd and has_xargs:
+                    # TURBO MODE: Use dd-based assembly for zstd (writes directly to final file offsets, no temp files)
+                    # This is MUCH faster for huge files - avoids creating temp decompressed chunks
+                    eprint(f"[chunked] Using TURBO mode: dd-based assembly (writes directly to final file, no temp decompressed chunks)")
+                    
+                    # Parse chunk size to bytes for dd block size calculation
+                    chunk_size_bytes = parse_size_to_bytes(args.chunk_size) if hasattr(args, 'chunk_size') else 20 * 1024**3
+                    src_size = src.stat().st_size
+                    
+                    # Choose dd block size that divides chunk size (prefer 4MiB, fallback to 1MiB)
+                    bs = 4 * 1024 * 1024  # 4MiB
+                    if chunk_size_bytes % bs != 0:
+                        bs = 1 * 1024 * 1024  # 1MiB
+                    if chunk_size_bytes % bs != 0:
+                        bs = 1024 * 1024  # Ensure it works
+                    
+                    chunk_blocks = chunk_size_bytes // bs
+                    remote_jobs = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
+                    
+                    assemble_cmd = f"""
+set -euo pipefail
+stage={stage_q}
+dest={dest_q}
+tmp="${{dest}}.incomplete.$$"
+size={src_size}
+bs={bs}
+chunk_blocks={chunk_blocks}
+jobs={remote_jobs}
+threads={decomp_threads}
+
+mkdir -p "$(dirname "$dest")"
+
+# Preallocate final file for better write performance
+(fallocate -l "$size" "$tmp" 2>/dev/null) || (truncate -s "$size" "$tmp")
+
+cd "$stage"
+
+# Ensure there are parts
+ls -1 part.*.zst >/dev/null 2>&1
+
+export bs chunk_blocks tmp threads
+
+# Decompress each part and write into correct offset using dd seek
+# File names are: part.0000.zst, part.0001.zst, ...
+ls -1 part.*.zst | sort | \\
+  xargs -n 1 -P "$jobs" -I{{}} bash -lc '
+    f="{{}}"
+    idx=${{f#part.}}
+    idx=${{idx%.zst}}
+    # Interpret leading zeros as base-10
+    off_blocks=$((10#$idx * chunk_blocks))
+    zstd -d -c -T"$threads" --fast --no-progress "$f" | dd of="$tmp" bs="$bs" seek="$off_blocks" conv=notrunc status=none
+  '
+
+# Verify size
+actual=$(stat -c %s "$tmp")
+if [ "$actual" -ne "$size" ]; then
+  echo "Size mismatch after assembly: expected=$size actual=$actual" >&2
+  exit 24
+fi
+
+# Move into place
+mv -f "$tmp" "$dest"
+
+# Cleanup compressed parts and stage dir
+rm -f part.*.zst
+cd /
+rmdir "$stage" 2>/dev/null || true
+"""
+                else:
+                    # Fall back to standard mode if dd/xargs not available
+                    eprint(f"[chunked] Turbo mode unavailable (missing dd/xargs) - using standard assembly")
+                    decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
+                    pattern = "part.*.zst"
+                    
+                    assemble_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={dest_q}
+tmp="${{dest}}.incomplete.$$"
+files=($(ls -1 {pattern} | sort))
+# Decompress all chunks in parallel to temp files
+for f in "${{files[@]}}"; do
+  {decomp_cmd_str} "$f" > "$f.decomp" &
+done
+wait  # Wait for all decompressions to finish
+# Concatenate all decompressed chunks at once (much faster than sequential append)
+decomp_files=()
+for f in "${{files[@]}}"; do
+  decomp_files+=("$f.decomp")
+done
+cat "${{decomp_files[@]}}" > "$tmp"
+# Cleanup
+rm -f "${{files[@]}}" "${{decomp_files[@]}}"
+mv -f "$tmp" "$dest"
+cd /
+rmdir {stage_q} || true
+"""
             else:
-                decomp_cmd_str = f"{decomp_cmd} -d -c"
-                pattern = f"part.*{ext}"
-            
-            # Optimized: decompress in parallel, then concatenate all at once (faster than sequential append)
-            assemble_cmd = f"""
+                # Standard mode: decompress in parallel, then concatenate
+                if compressor == "zstd":
+                    decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
+                    pattern = "part.*.zst"
+                elif compressor in ("pigz", "gzip"):
+                    decomp_cmd_str = f"pigz -d -c -p {decomp_threads} 2>/dev/null || gunzip -c || gzip -d -c"
+                    pattern = "part.*.gz"
+                else:
+                    decomp_cmd_str = f"{decomp_cmd} -d -c"
+                    pattern = f"part.*{ext}"
+                
+                assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -1179,6 +1504,313 @@ rmdir {stage_q} || true
             pass
 
 
+def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str],
+                  dest_file: str, dest_dir: str, ssh_e: Optional[str],
+                  control_path: Optional[str], cipher: Optional[str]) -> None:
+    """
+    TURBO (zstd): chunked + parallel compress+transfer + parallel remote assemble.
+
+    Key design goals:
+      - No uncompressed split files on disk (reads source by offset via dd)
+      - Multiple independent SSH TCP connections (disable ControlMaster mux for parallel data)
+      - Parallel remote reassembly WITHOUT writing decompressed temp chunks (scatter write into preallocated file)
+    """
+    if args.compressor != "zstd":
+        raise RuntimeError("Strategy 'turbo' is zstd-only. Use --compressor zstd.")
+    if which("zstd") is None:
+        raise RuntimeError("Strategy 'turbo' requires zstd installed on SOURCE.")
+    if which("dd") is None:
+        raise RuntimeError("Strategy 'turbo' requires dd on SOURCE.")
+    if which("rsync") is None:
+        raise RuntimeError("Strategy 'turbo' requires rsync on SOURCE.")
+
+    if is_local:
+        raise RuntimeError("Strategy 'turbo' is intended for remote targets (user@host:/path).")
+
+    assert user is not None and host is not None and cipher is not None and ssh_e is not None, "remote fields not set"
+
+    # Check remote dependencies
+    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "zstd"):
+        raise RuntimeError("Strategy 'turbo' requires zstd installed on TARGET as well.")
+    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd"):
+        raise RuntimeError("Strategy 'turbo' requires dd installed on TARGET as well.")
+
+    src = Path(args.source).resolve()
+    src_size = src.stat().st_size
+    if src_size == 0:
+        raise RuntimeError("Source file is empty; nothing to transfer.")
+
+    # Chunk sizing
+    try:
+        chunk_bytes = parse_size_to_bytes(args.chunk_size)
+    except Exception as e:
+        raise RuntimeError(f"Invalid --chunk-size {args.chunk_size!r}: {e}")
+    if chunk_bytes <= 0:
+        raise RuntimeError("chunk size must be > 0")
+
+    # Pick a dd block size that divides chunk_bytes (important for seek math)
+    bs_bytes = choose_block_size(chunk_bytes, max_bs=16 * 1024 * 1024)
+
+    if chunk_bytes % bs_bytes != 0:
+        # This should not happen with choose_block_size, but keep it defensive
+        raise RuntimeError(f"Internal error: bs_bytes={bs_bytes} does not divide chunk_bytes={chunk_bytes}")
+
+    n_chunks = (src_size + chunk_bytes - 1) // chunk_bytes
+    suffix_len = max(4, len(str(n_chunks - 1)))
+
+    parallel = max(1, int(args.parallel))
+
+    # Disable SSH multiplexing for data channels (multiple rsync in parallel should be multiple TCP conns)
+    ssh_e_xfer = ssh_e + " -o ControlMaster=no -o ControlPersist=no -o ControlPath=none"
+
+    # Threads per zstd job (source side)
+    local_cpus = local_cpu_count()
+    if getattr(args, "compression_threads", 0) and args.compression_threads > 0:
+        comp_threads = int(args.compression_threads)
+    else:
+        # Leave headroom for SSH encryption + kernel IO
+        comp_threads = max(1, int((local_cpus * 0.80) // parallel))
+
+    # Threads per zstd job (remote side)
+    remote_cpus = remote_cpu(user, host, args.connect_timeout, cipher, control_path)
+    assemble_parallel = int(getattr(args, "assemble_parallel", 0) or 0)
+    if assemble_parallel <= 0:
+        assemble_parallel = parallel
+    assemble_parallel = max(1, min(assemble_parallel, remote_cpus))
+
+    if getattr(args, "decompression_threads", 0) and args.decompression_threads > 0:
+        decomp_threads = int(args.decompression_threads)
+    else:
+        decomp_threads = max(1, int((remote_cpus * 0.80) // assemble_parallel))
+
+    level = int(args.compression_level)
+
+    # Remote staging directory: if destination filesystem is NFS, stage on /var/tmp (local disk) by default.
+    dest_fs = remote_fs_type(user, host, args.connect_timeout, cipher, control_path, dest_dir)
+    stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
+    if not stage_base:
+        if "nfs" in dest_fs.lower():
+            stage_base = "/var/tmp"
+        else:
+            stage_base = dest_dir
+
+    stage_dir = f"{stage_base.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
+    eprint(f"[turbo] src={src.name} size={human_bytes(src_size)} chunks={n_chunks} chunk={human_bytes(chunk_bytes)} bs={human_bytes(bs_bytes)}")
+    eprint(f"[turbo] parallel={parallel} comp_threads/job={comp_threads} assemble_parallel={assemble_parallel} decomp_threads/job={decomp_threads}")
+    eprint(f"[turbo] remote dest_fs={dest_fs} stage_dir={stage_dir}")
+
+    remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, stage_dir)
+
+    # Local workdir for transient compressed chunks
+    if args.workdir:
+        workdir = Path(args.workdir).resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+        tmpdir = workdir / f".xfer_turbo_{src.name}_{int(time.time())}"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        cleanup_tmpdir = getattr(args, "cleanup_workdir", False)
+    else:
+        temp_base = getattr(args, "temp_dir", None) or tempfile.gettempdir()
+        tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_turbo_{src.name}_", dir=temp_base))
+        cleanup_tmpdir = True
+
+    dest_stage = f"{user}@{host}:{stage_dir.rstrip('/')}/"
+
+    # Worker: compress a chunk by offset (dd) -> zstd file, then rsync it, then delete local chunk.
+    def process_chunk(idx: int) -> None:
+        offset_bytes = idx * chunk_bytes
+        if offset_bytes >= src_size:
+            return
+        remaining = src_size - offset_bytes
+        this_size = min(chunk_bytes, remaining)
+
+        out_name = f"part.{idx:0{suffix_len}d}.zst"
+        out_path = tmpdir / out_name
+
+        # dd math in blocks
+        skip_blocks = offset_bytes // bs_bytes
+        # Count blocks: exact for all but last; ceil for last
+        count_blocks = (this_size + bs_bytes - 1) // bs_bytes
+
+        # dd -> zstd (stdin)
+        dd_cmd = [
+            "dd",
+            f"if={str(src)}",
+            f"bs={bs_bytes}",
+            f"skip={skip_blocks}",
+            f"count={count_blocks}",
+            "iflag=fullblock",
+            "status=none",
+        ]
+        z_cmd = [
+            "zstd",
+            f"-{level}",
+            f"-T{comp_threads}",
+            "--no-progress",
+            "-o", str(out_path),
+            "-",  # stdin
+        ]
+
+        dd_p = subprocess.Popen(dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert dd_p.stdout is not None
+        z_p = subprocess.Popen(z_cmd, stdin=dd_p.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        dd_p.stdout.close()
+
+        dd_err = dd_p.stderr.read() if dd_p.stderr else b""
+        z_err = z_p.stderr.read() if z_p.stderr else b""
+
+        dd_rc = dd_p.wait()
+        z_rc = z_p.wait()
+
+        if dd_rc != 0:
+            raise RuntimeError(f"[turbo] dd failed for chunk {idx}: {dd_err.decode('utf-8', errors='ignore')}")
+        if z_rc != 0:
+            raise RuntimeError(f"[turbo] zstd failed for chunk {idx}: {z_err.decode('utf-8', errors='ignore')}")
+
+        # Transfer compressed chunk
+        rsync_cmd = [
+            "rsync",
+            "-t",
+            "--whole-file",
+            "--partial",
+            "--inplace",
+            "--protect-args",
+            f"--timeout={args.rsync_timeout}",
+            "-e", ssh_e_xfer,
+            str(out_path),
+            dest_stage,
+        ]
+        try:
+            subprocess.run(rsync_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        except subprocess.CalledProcessError as e:
+            msg = e.stderr.decode("utf-8", errors="ignore") if e.stderr else "unknown error"
+            raise RuntimeError(f"[turbo] rsync failed for chunk {idx}: {msg}")
+
+        # Cleanup local chunk artifact unless asked to keep
+        if not getattr(args, "keep_local_artifact", False):
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    eprint(f"[turbo] Compress+transfer pipeline starting...")
+    start = time.time()
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=parallel) as ex:
+        futs = {ex.submit(process_chunk, i): i for i in range(n_chunks)}
+        for fut in as_completed(futs):
+            idx = futs[fut]
+            fut.result()  # raise if any
+            completed += 1
+            if completed % max(1, n_chunks // 20) == 0 or completed == n_chunks:
+                elapsed = time.time() - start
+                eprint(f"[turbo] progress: {completed}/{n_chunks} chunks done ({elapsed:.1f}s)")
+
+    pipe_elapsed = time.time() - start
+    eprint(f"[turbo] ✓ All chunks transferred in {pipe_elapsed:.1f}s")
+
+    # Assemble on destination.
+    # If destination FS is NFS, prefer sequential append (large sequential writes) over random scatter.
+    assemble_mode = "seek"
+    if "nfs" in dest_fs.lower():
+        assemble_mode = "append"
+
+    stage_q = shlex.quote(stage_dir)
+    dest_q = shlex.quote(dest_file)
+
+    if assemble_mode == "append":
+        eprint(f"[turbo] Remote assemble mode=append (dest on NFS detected)")
+        remote_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={dest_q}
+tmp="${{dest}}.incomplete.$$"
+: > "$tmp"
+files=( $(ls -1 part.*.zst | sort) )
+for f in "${{files[@]}}"; do
+  zstd -d -c -T{decomp_threads} --fast "$f" >> "$tmp"
+done
+mv -f "$tmp" "$dest"
+rm -f "${{files[@]}}"
+cd /
+rmdir {stage_q} 2>/dev/null || true
+"""
+    else:
+        eprint(f"[turbo] Remote assemble mode=seek (parallel scatter write)")
+        remote_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={dest_q}
+tmp="${{dest}}.incomplete.$$"
+chunk_bytes={chunk_bytes}
+bs={bs_bytes}
+parallel={assemble_parallel}
+threads={decomp_threads}
+total_size={src_size}
+
+# Create/size output file
+(fallocate -l "$total_size" "$tmp" 2>/dev/null) || (truncate -s "$total_size" "$tmp")
+
+files=( $(ls -1 part.*.zst | sort) )
+pids=()
+fail=0
+
+run_one() {{
+  local f="$1"
+  local base="${{f##*/}}"
+  local num="${{base#part.}}"
+  num="${{num%.zst}}"
+  local idx=$((10#$num))
+  local offset=$((idx * chunk_bytes))
+  local seek=$((offset / bs))
+  (
+    set -euo pipefail
+    zstd -d -c -T"$threads" --fast "$f" | dd of="$tmp" bs="$bs" seek="$seek" conv=notrunc status=none
+  ) &
+  echo $!
+}}
+
+for f in "${{files[@]}}"; do
+  pid=$(run_one "$f")
+  pids+=("$pid")
+  if [ "${{#pids[@]}}" -ge "$parallel" ]; then
+    first="${{pids[0]}}"
+    if ! wait "$first"; then
+      fail=1
+      break
+    fi
+    pids=("${{pids[@]:1}}")
+  fi
+done
+
+if [ "$fail" -eq 1 ]; then
+  for pid in "${{pids[@]}}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  exit 1
+fi
+
+for pid in "${{pids[@]}}"; do
+  wait "$pid"
+done
+
+mv -f "$tmp" "$dest"
+rm -f "${{files[@]}}"
+cd /
+rmdir {stage_q} 2>/dev/null || true
+"""
+    run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
+
+    # Cleanup local tempdir
+    if cleanup_tmpdir and not getattr(args, "keep_local_artifact", False):
+        try:
+            for child in tmpdir.glob("*"):
+                child.unlink()
+            tmpdir.rmdir()
+        except Exception:
+            pass
+
+
 def sha256sum_local(path: Path) -> str:
     h = subprocess.run(["sha256sum", str(path)], check=True, stdout=subprocess.PIPE, text=True).stdout.strip().split()[0]
     return h
@@ -1203,7 +1835,8 @@ def main() -> int:
     p.add_argument("source", type=Path, help="Source file path on this machine")
     p.add_argument("target", help="Target: /abs/path (local) OR user@10.0.0.15:/abs/path OR 10.0.0.15:/abs/path (remote, absolute path required)")
     p.add_argument("--user", default=None, help="SSH user (if not provided in target)")
-    p.add_argument("--strategy", choices=["auto", "direct", "compress", "chunked", "stream"], default="auto", help="Transfer strategy (chunked=split+transfer, stream=compress+transfer simultaneously, use --compress-chunks for split+compress)")
+    p.add_argument("--nfs-server", default=None, help="NFS server hostname/IP for NFS-to-NFS streaming (enables SSH streaming to NFS server even for local-looking paths)")
+    p.add_argument("--strategy", choices=["auto", "direct", "compress", "chunked", "stream", "turbo"], default="auto", help="Transfer strategy (chunked=split+transfer, stream=compress+transfer simultaneously, turbo=zstd-only optimized chunked with dd-based assembly, use --compress-chunks for split+compress)")
     p.add_argument("--append-only", action="store_true", help="Use rsync --append-verify (only if file only grows by appending)")
     p.add_argument("--whole-file", action="store_true", help="Use rsync --whole-file (fastest first transfer, weakest resume)")
     p.add_argument("--inplace", action="store_true", help="Use rsync --inplace (better resume semantics; can be riskier if interrupted)")
@@ -1219,7 +1852,9 @@ def main() -> int:
     p.add_argument("--keep-local-artifact", action="store_true", help="Keep local compressed artifact for compress strategy")
     p.add_argument("--keep-compressed", action="store_true", help="Keep compressed file on destination (skip decompression)")
     p.add_argument("--chunk-size", default="20G", help="Chunk size for chunked strategy (e.g., 4G, 20G, 500M). Optimal: 5-20G for 10G links, 10-50G for 25G+, smaller for slower links")
-    p.add_argument("--parallel", type=int, default=1, help="Parallel transfers for chunked strategy")
+    p.add_argument("--parallel", type=int, default=1, help="Parallel transfers for chunked/turbo strategy")
+    p.add_argument("--assemble-parallel", type=int, default=0, help="TURBO/chunked: parallel jobs for destination-side reassembly (0=auto; default: same as --parallel)")
+    p.add_argument("--remote-stage-base", default="", help="TURBO: remote base dir for staging chunk files (default: auto; uses /var/tmp when destination is NFS)")
     p.add_argument("--compress-chunks", action="store_true", help="In chunked mode, compress each chunk before transfer")
     p.add_argument("--keep-local-parts", action="store_true", help="Keep uncompressed local parts after compressing chunks")
     p.add_argument("--cleanup-local-parts", action="store_true", help="Delete local parts after successful chunked transfer")
@@ -1252,7 +1887,7 @@ def main() -> int:
         eprint("ERROR: requires rsync installed.")
         return 2
 
-    is_local, user, host, target_path = parse_target(args.target, args.user)
+    is_local, user, host, target_path = parse_target(args.target, args.user, nfs_server=getattr(args, 'nfs_server', None))
     dest_dir, dest_file = normalize_dest_path(target_path, src)
 
     # For local transfers, we don't need SSH
@@ -1354,6 +1989,8 @@ def main() -> int:
             strategy_stream_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
         elif strategy == "chunked":
             strategy_chunked(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
+        elif strategy == "turbo":
+            strategy_turbo(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
         else:
             raise RuntimeError(f"Unknown strategy: {strategy}")
 

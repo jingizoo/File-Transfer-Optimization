@@ -229,3 +229,20 @@ fast-xfer /data/20gb_file.txt user@10.0.0.15:/data/replica/ \
   --compressor pigz \
   --compression-level 6 \
   --keep-compressed
+
+# Example 39: NFS-to-NFS streaming (stream via SSH to NFS server)
+echo "Example 39: NFS-to-NFS streaming - Stream compress+transfer+decompress via SSH to NFS server"
+fast-xfer /mnt/nfs1/500gb_file.txt /mnt/nfs2/replica/ \
+  --strategy stream \
+  --compressor pigz \
+  --compression-level 6 \
+  --nfs-server nfs-server.example.com \
+  --user myuser
+
+# Example 40: NFS-to-NFS streaming with auto-detection (if NFS mount detected)
+echo "Example 40: NFS-to-NFS streaming with auto-detection (if destination is NFS mount)"
+fast-xfer /mnt/nfs1/500gb_file.txt /mnt/nfs2/replica/ \
+  --strategy stream \
+  --compressor zstd \
+  --compression-level 3 \
+  --nfs-server nfs-server.example.com
