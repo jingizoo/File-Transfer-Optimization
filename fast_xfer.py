@@ -825,7 +825,7 @@ def main() -> int:
     p.add_argument("--compression-level", type=int, default=6, help="Compression level (1=fast, 6=default for pigz/gzip, 3=default for zstd)")
     p.add_argument("--compression-threads", type=int, default=0, help="Threads for compression (0=auto, pigz only)")
     p.add_argument("--keep-local-artifact", action="store_true", help="Keep local compressed artifact for compress strategy")
-    p.add_argument("--chunk-size", default="20G", help="Chunk size for chunked strategy (e.g., 4G, 20G, 500M)")
+    p.add_argument("--chunk-size", default="20G", help="Chunk size for chunked strategy (e.g., 4G, 20G, 500M). Optimal: 5-20G for 10G links, 10-50G for 25G+, smaller for slower links")
     p.add_argument("--parallel", type=int, default=1, help="Parallel transfers for chunked strategy")
     p.add_argument("--compress-chunks", action="store_true", help="In chunked mode, compress each chunk before transfer")
     p.add_argument("--keep-local-parts", action="store_true", help="Keep uncompressed local parts after compressing chunks")

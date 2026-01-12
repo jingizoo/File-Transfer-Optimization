@@ -205,7 +205,7 @@ Best for:
 
 1. Split file into chunks
 2. Optionally compress each chunk
-3. Transfer chunks in parallel
+3. Transfer chunks in parallel (truly concurrent)
 4. Reassemble on remote host
 5. Clean up temporary files
 
@@ -213,6 +213,12 @@ Best for:
 - Very large files (hundreds of GB+)
 - High-speed links (10G/25G/40G)
 - When you need to saturate bandwidth
+
+**Chunk Size Selection:**
+- **10Gbps+ links**: 20G - 50G chunks, 4-8 parallel workers
+- **1-5Gbps links**: 5G - 10G chunks, 2-4 parallel workers  
+- **< 1Gbps links**: 1G - 2G chunks, 1-2 parallel workers
+- See `CHUNK_SIZE_GUIDE.md` for detailed optimization guide
 
 ## Performance Tuning
 
