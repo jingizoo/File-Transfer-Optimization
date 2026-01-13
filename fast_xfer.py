@@ -42,8 +42,8 @@ except ImportError:
     select = None
 
 
-def eprint(*args: object) -> None:
-    print(*args, file=sys.stderr)
+def eprint(*args: object, **kwargs) -> None:
+    print(*args, file=sys.stderr, **kwargs)
 
 
 def which(cmd: str) -> Optional[str]:
@@ -1123,7 +1123,7 @@ def split_file(src: Path, part_prefix: Path, chunk_size: str, parallel: int = 1)
     return parts
 
 
-def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int, keep_parts: bool) -> list[Path]:
+def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int, keep_parts: bool, compression_threads: Optional[int] = None) -> list[Path]:
     comp_info = get_compressor_cmd(compressor)
     if not comp_info:
         raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
@@ -1131,19 +1131,32 @@ def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int
     comp_cmd, _, ext = comp_info
     out: list[Path] = []
 
-    eprint(f"[chunked] Compressing {len(parts)} parts with {compressor} level {level} (parallel={parallel})...")
+    # Determine compression threads per job
+    local_cpus = local_cpu_count()
+    if compression_threads and compression_threads > 0:
+        comp_threads = compression_threads
+    else:
+        # Auto-detect: use more threads per job when parallel is low, fewer when parallel is high
+        # Leave headroom for I/O and other processes
+        if parallel > 0:
+            comp_threads = max(1, int((local_cpus * 0.80) // parallel))
+        else:
+            comp_threads = max(1, int(local_cpus * 0.80))
+    
+    eprint(f"[chunked] Compressing {len(parts)} parts with {compressor} level {level} (parallel={parallel}, threads/job={comp_threads})...")
 
     def do_one(p: Path) -> Path:
         comp_file = Path(str(p) + ext)
         
         if compressor == "zstd":
-            run_checked([comp_cmd, f"-{level}", "-T1", "--no-progress", "-o", str(comp_file), str(p)])
+            run_checked([comp_cmd, f"-{level}", f"-T{comp_threads}", "--no-progress", "-o", str(comp_file), str(p)])
         elif compressor == "pigz":
             # pigz -c reads from stdin, so redirect input
-            cmd = [comp_cmd, f"-{level}", "-p", "1", "-c"]
+            cmd = [comp_cmd, f"-{level}", "-p", str(comp_threads), "-c"]
             with open(p, "rb") as infile, open(comp_file, "wb") as outfile:
                 subprocess.run(cmd, stdin=infile, stdout=outfile, check=True, stderr=subprocess.PIPE)
         elif compressor == "gzip":
+            # gzip doesn't support multi-threading, so use single thread
             cmd = [comp_cmd, f"-{level}", "-c", str(p)]
             with open(comp_file, "wb") as out:
                 subprocess.run(cmd, stdout=out, check=True, stderr=subprocess.PIPE)
@@ -1369,7 +1382,7 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
                 if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs"):
                     eprint(f"[chunked] WARNING: 'xargs' not found on remote - turbo mode (dd-based assembly) will be disabled")
         
-        parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts)
+        parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts, compression_threads=getattr(args, 'compression_threads', None))
 
     # Determine staging directory: for NFS destinations, stage on local disk for faster assembly
     stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
