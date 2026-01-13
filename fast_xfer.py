@@ -1426,7 +1426,7 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         _, decomp_cmd, ext = get_compressor_cmd(compressor) or (None, None, None)
         
         if args.keep_compressed:
-            # Keep compressed chunks and concatenate them - OPTIMIZED: concatenate all at once
+            # Keep compressed chunks and concatenate them - PARALLEL: use dd seek for parallel writes
             eprint(f"[chunked] Keeping compressed chunks and concatenating to {dest_q}{ext}...")
             if compressor == "zstd":
                 pattern = "part.*.zst"
@@ -1435,12 +1435,109 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             else:
                 pattern = f"part.*{ext}"
             
+            # Check if we can use parallel dd-based assembly (requires dd and xargs)
+            can_parallel = False
+            if not is_local:
+                has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
+                has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
+                can_parallel = has_dd and has_xargs
+            else:
+                can_parallel = which("dd") is not None and which("xargs") is not None
+            
             # Check if staging and destination are different (e.g., staged on /var/tmp, dest on NFS)
             final_dest = f"{dest_q}{ext}"
             final_dest_q = shlex.quote(final_dest)
-            if stage_dir != dest_dir:
-                # Staged on local disk, need to move to NFS destination
-                assemble_cmd = f"""
+            assemble_parallel = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
+            
+            if can_parallel:
+                # PARALLEL MODE: Use dd seek to write chunks in parallel (with job limit)
+                eprint(f"[chunked] Using parallel dd-based concatenation ({assemble_parallel} workers)")
+                if stage_dir != dest_dir:
+                    # Staged on local disk, need to move to NFS destination
+                    assemble_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+tmp="tmp_$$.zst"
+files=($(ls -1 {pattern} | sort))
+# Calculate total size and preallocate
+total_size=0
+for f in "${{files[@]}}"; do
+  total_size=$((total_size + $(stat -c %s "$f")))
+done
+# Preallocate output file
+(fallocate -l "$total_size" "$tmp" 2>/dev/null) || (truncate -s "$total_size" "$tmp")
+# Write chunks in parallel using dd seek (limit parallel jobs)
+offset=0
+pids=()
+for f in "${{files[@]}}"; do
+  size=$(stat -c %s "$f")
+  seek_mb=$((offset / 1048576))
+  count_mb=$((size / 1048576 + 1))
+  dd if="$f" of="$tmp" bs=1M seek=$seek_mb count=$count_mb conv=notrunc status=none &
+  pids+=($!)
+  offset=$((offset + size))
+  # Limit parallel jobs
+  if [ "${{#pids[@]}}" -ge {assemble_parallel} ]; then
+    wait "${{pids[0]}}"
+    pids=("${{pids[@]:1}}")
+  fi
+done
+# Wait for remaining jobs
+for pid in "${{pids[@]}}"; do
+  wait "$pid"
+done
+# Move final file to NFS destination
+mkdir -p "$(dirname {final_dest_q})"
+mv -f "$tmp" {final_dest_q}
+rm -f "${{files[@]}}"
+cd /
+rmdir {stage_q} || true
+"""
+                else:
+                    # Staging and destination are same - concatenate directly
+                    assemble_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={final_dest_q}
+tmp="${{dest}}.incomplete.$$"
+files=($(ls -1 {pattern} | sort))
+# Calculate total size and preallocate
+total_size=0
+for f in "${{files[@]}}"; do
+  total_size=$((total_size + $(stat -c %s "$f")))
+done
+# Preallocate output file
+(fallocate -l "$total_size" "$tmp" 2>/dev/null) || (truncate -s "$total_size" "$tmp")
+# Write chunks in parallel using dd seek (limit parallel jobs)
+offset=0
+pids=()
+for f in "${{files[@]}}"; do
+  size=$(stat -c %s "$f")
+  seek_mb=$((offset / 1048576))
+  count_mb=$((size / 1048576 + 1))
+  dd if="$f" of="$tmp" bs=1M seek=$seek_mb count=$count_mb conv=notrunc status=none &
+  pids+=($!)
+  offset=$((offset + size))
+  # Limit parallel jobs
+  if [ "${{#pids[@]}}" -ge {assemble_parallel} ]; then
+    wait "${{pids[0]}}"
+    pids=("${{pids[@]:1}}")
+  fi
+done
+# Wait for remaining jobs
+for pid in "${{pids[@]}}"; do
+  wait "$pid"
+done
+mv -f "$tmp" "$dest"
+rm -f "${{files[@]}}"
+cd /
+rmdir {stage_q} || true
+"""
+            else:
+                # FALLBACK: Sequential cat (if dd/xargs not available)
+                eprint(f"[chunked] Parallel concatenation unavailable (missing dd/xargs) - using sequential cat")
+                if stage_dir != dest_dir:
+                    assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 tmp="tmp_$$.zst"
@@ -1454,9 +1551,8 @@ mv -f "$tmp" {final_dest_q}
 cd /
 rmdir {stage_q} || true
 """
-            else:
-                # Staging and destination are same - concatenate directly
-                assemble_cmd = f"""
+                else:
+                    assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={final_dest_q}
@@ -1614,8 +1710,64 @@ cd /
 rmdir {stage_q} || true
 """
     else:
-        # Optimized: concatenate all chunks at once instead of sequential append
-        assemble_cmd = f"""
+        # Uncompressed chunks: use parallel dd-based concatenation if possible
+        can_parallel = False
+        if not is_local:
+            has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
+            has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
+            can_parallel = has_dd and has_xargs
+        else:
+            can_parallel = which("dd") is not None and which("xargs") is not None
+        
+        assemble_parallel = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
+        
+        if can_parallel:
+            # PARALLEL MODE: Use dd seek to write chunks in parallel (with job limit)
+            eprint(f"[chunked] Using parallel dd-based concatenation for uncompressed chunks ({assemble_parallel} workers)")
+            bs = 4 * 1024 * 1024  # 4MiB block size
+            
+            assemble_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={dest_q}
+tmp="${{dest}}.incomplete.$$"
+files=($(ls -1 part.* | sort))
+# Calculate total size and preallocate
+total_size=0
+for f in "${{files[@]}}"; do
+  total_size=$((total_size + $(stat -c %s "$f")))
+done
+# Preallocate output file
+(fallocate -l "$total_size" "$tmp" 2>/dev/null) || (truncate -s "$total_size" "$tmp")
+# Write chunks in parallel using dd seek (limit parallel jobs)
+offset=0
+pids=()
+for f in "${{files[@]}}"; do
+  size=$(stat -c %s "$f")
+  seek_blocks=$((offset / {bs}))
+  count_blocks=$((size / {bs} + 1))
+  dd if="$f" of="$tmp" bs={bs} seek=$seek_blocks count=$count_blocks conv=notrunc status=none &
+  pids+=($!)
+  offset=$((offset + size))
+  # Limit parallel jobs
+  if [ "${{#pids[@]}}" -ge {assemble_parallel} ]; then
+    wait "${{pids[0]}}"
+    pids=("${{pids[@]:1}}")
+  fi
+done
+# Wait for remaining jobs
+for pid in "${{pids[@]}}"; do
+  wait "$pid"
+done
+mv -f "$tmp" "$dest"
+rm -f "${{files[@]}}"
+cd /
+rmdir {stage_q} || true
+"""
+        else:
+            # FALLBACK: Sequential cat (if dd/xargs not available)
+            eprint(f"[chunked] Parallel concatenation unavailable (missing dd/xargs) - using sequential cat")
+            assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
