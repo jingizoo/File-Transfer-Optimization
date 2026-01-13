@@ -1293,7 +1293,29 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         
         parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts)
 
-    stage_dir = f"{dest_dir.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
+    # Determine staging directory: for NFS destinations, stage on local disk for faster assembly
+    stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
+    if not stage_base:
+        if is_local:
+            # Check if destination is on NFS mount
+            nfs_info = get_nfs_info(dest_dir)
+            if nfs_info:
+                # NFS mount detected - stage on local disk for faster concatenation
+                stage_base = "/var/tmp"
+                eprint(f"[chunked] NFS mount detected at destination - staging on {stage_base} for faster assembly")
+            else:
+                stage_base = dest_dir
+        else:
+            # Remote: detect filesystem type
+            assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+            dest_fs = remote_fs_type(user, host, args.connect_timeout, cipher, control_path, dest_dir)
+            if "nfs" in dest_fs.lower():
+                stage_base = "/var/tmp"
+                eprint(f"[chunked] Remote NFS detected - staging on {stage_base} for faster assembly")
+            else:
+                stage_base = dest_dir
+
+    stage_dir = f"{stage_base.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
     if is_local:
         local_mkdir_p(stage_dir)
     else:
@@ -1322,11 +1344,31 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             else:
                 pattern = f"part.*{ext}"
             
-            # Optimized: concatenate all files at once instead of sequential append
-            assemble_cmd = f"""
+            # Check if staging and destination are different (e.g., staged on /var/tmp, dest on NFS)
+            final_dest = f"{dest_q}{ext}"
+            final_dest_q = shlex.quote(final_dest)
+            if stage_dir != dest_dir:
+                # Staged on local disk, need to move to NFS destination
+                assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
-dest={dest_q}{ext}
+tmp="tmp_$$.zst"
+files=($(ls -1 {pattern} | sort))
+# Concatenate all compressed chunks at once on local disk (much faster than on NFS)
+cat "${{files[@]}}" > "$tmp"
+rm -f "${{files[@]}}"
+# Move final file to NFS destination
+mkdir -p "$(dirname {final_dest_q})"
+mv -f "$tmp" {final_dest_q}
+cd /
+rmdir {stage_q} || true
+"""
+            else:
+                # Staging and destination are same - concatenate directly
+                assemble_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={final_dest_q}
 tmp="${{dest}}.incomplete.$$"
 files=($(ls -1 {pattern} | sort))
 # Concatenate all compressed chunks at once (much faster than sequential append)
