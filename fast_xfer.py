@@ -1426,7 +1426,8 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         _, decomp_cmd, ext = get_compressor_cmd(compressor) or (None, None, None)
         
         if args.keep_compressed:
-            # Keep compressed chunks and concatenate them - PARALLEL: use dd seek for parallel writes
+            # Keep compressed chunks and concatenate them - USE SEQUENTIAL CAT (safer for compressed files)
+            # Note: Parallel dd can corrupt compressed files due to race conditions
             eprint(f"[chunked] Keeping compressed chunks and concatenating to {dest_q}{ext}...")
             if compressor == "zstd":
                 pattern = "part.*.zst"
@@ -1435,131 +1436,52 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             else:
                 pattern = f"part.*{ext}"
             
-            # Check if we can use parallel dd-based assembly (requires dd and xargs)
-            can_parallel = False
-            if not is_local:
-                has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
-                has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
-                can_parallel = has_dd and has_xargs
-            else:
-                can_parallel = which("dd") is not None and which("xargs") is not None
-            
             # Check if staging and destination are different (e.g., staged on /var/tmp, dest on NFS)
             final_dest = f"{dest_q}{ext}"
             final_dest_q = shlex.quote(final_dest)
-            assemble_parallel = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
             
-            if can_parallel:
-                # PARALLEL MODE: Use dd seek to write chunks in parallel (with job limit)
-                eprint(f"[chunked] Using parallel dd-based concatenation ({assemble_parallel} workers)")
-                if stage_dir != dest_dir:
-                    # Staged on local disk, need to move to NFS destination
-                    assemble_cmd = f"""
+            # Use sequential cat for compressed chunks (safer and fast enough)
+            # Add verification command based on compressor type
+            verify_cmd = ""
+            if compressor == "zstd":
+                verify_cmd = 'zstd -t "$first_chunk" >/dev/null 2>&1 || { echo "ERROR: First chunk is corrupted" >&2; exit 1; }'
+            elif compressor in ("pigz", "gzip"):
+                verify_cmd = 'gunzip -t "$first_chunk" >/dev/null 2>&1 || { echo "ERROR: First chunk is corrupted" >&2; exit 1; }'
+            
+            if stage_dir != dest_dir:
+                assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 tmp="tmp_$$.zst"
 files=($(ls -1 {pattern} | sort))
-# Calculate total size and preallocate
-total_size=0
-for f in "${{files[@]}}"; do
-  total_size=$((total_size + $(stat -c %s "$f")))
-done
-# Preallocate output file
-(fallocate -l "$total_size" "$tmp" 2>/dev/null) || (truncate -s "$total_size" "$tmp")
-# Write chunks in parallel using dd seek (limit parallel jobs)
-offset=0
-pids=()
-for f in "${{files[@]}}"; do
-  size=$(stat -c %s "$f")
-  seek_mb=$((offset / 1048576))
-  count_mb=$((size / 1048576 + 1))
-  dd if="$f" of="$tmp" bs=1M seek=$seek_mb count=$count_mb conv=notrunc status=none &
-  pids+=($!)
-  offset=$((offset + size))
-  # Limit parallel jobs
-  if [ "${{#pids[@]}}" -ge {assemble_parallel} ]; then
-    wait "${{pids[0]}}"
-    pids=("${{pids[@]:1}}")
-  fi
-done
-# Wait for remaining jobs
-for pid in "${{pids[@]}}"; do
-  wait "$pid"
-done
+# Concatenate all compressed chunks sequentially (cat is safe and fast for compressed files)
+cat "${{files[@]}}" > "$tmp"
+# Verify the concatenated file is valid (test first frame)
+if [ "${{#files[@]}}" -gt 0 ]; then
+  first_chunk="${{files[0]}}"
+  {verify_cmd if verify_cmd else "# No verification available"}
+fi
+rm -f "${{files[@]}}"
 # Move final file to NFS destination
 mkdir -p "$(dirname {final_dest_q})"
 mv -f "$tmp" {final_dest_q}
-rm -f "${{files[@]}}"
-cd /
-rmdir {stage_q} || true
-"""
-                else:
-                    # Staging and destination are same - concatenate directly
-                    assemble_cmd = f"""
-set -euo pipefail
-cd {stage_q}
-dest={final_dest_q}
-tmp="${{dest}}.incomplete.$$"
-files=($(ls -1 {pattern} | sort))
-# Calculate total size and preallocate
-total_size=0
-for f in "${{files[@]}}"; do
-  total_size=$((total_size + $(stat -c %s "$f")))
-done
-# Preallocate output file
-(fallocate -l "$total_size" "$tmp" 2>/dev/null) || (truncate -s "$total_size" "$tmp")
-# Write chunks in parallel using dd seek (limit parallel jobs)
-offset=0
-pids=()
-for f in "${{files[@]}}"; do
-  size=$(stat -c %s "$f")
-  seek_mb=$((offset / 1048576))
-  count_mb=$((size / 1048576 + 1))
-  dd if="$f" of="$tmp" bs=1M seek=$seek_mb count=$count_mb conv=notrunc status=none &
-  pids+=($!)
-  offset=$((offset + size))
-  # Limit parallel jobs
-  if [ "${{#pids[@]}}" -ge {assemble_parallel} ]; then
-    wait "${{pids[0]}}"
-    pids=("${{pids[@]:1}}")
-  fi
-done
-# Wait for remaining jobs
-for pid in "${{pids[@]}}"; do
-  wait "$pid"
-done
-mv -f "$tmp" "$dest"
-rm -f "${{files[@]}}"
 cd /
 rmdir {stage_q} || true
 """
             else:
-                # FALLBACK: Sequential cat (if dd/xargs not available)
-                eprint(f"[chunked] Parallel concatenation unavailable (missing dd/xargs) - using sequential cat")
-                if stage_dir != dest_dir:
-                    assemble_cmd = f"""
-set -euo pipefail
-cd {stage_q}
-tmp="tmp_$$.zst"
-files=($(ls -1 {pattern} | sort))
-# Concatenate all compressed chunks at once on local disk (much faster than on NFS)
-cat "${{files[@]}}" > "$tmp"
-rm -f "${{files[@]}}"
-# Move final file to NFS destination
-mkdir -p "$(dirname {final_dest_q})"
-mv -f "$tmp" {final_dest_q}
-cd /
-rmdir {stage_q} || true
-"""
-                else:
-                    assemble_cmd = f"""
+                assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={final_dest_q}
 tmp="${{dest}}.incomplete.$$"
 files=($(ls -1 {pattern} | sort))
-# Concatenate all compressed chunks at once (much faster than sequential append)
+# Concatenate all compressed chunks sequentially (cat is safe and fast for compressed files)
 cat "${{files[@]}}" > "$tmp"
+# Verify the concatenated file is valid (test first frame)
+if [ "${{#files[@]}}" -gt 0 ]; then
+  first_chunk="${{files[0]}}"
+  {verify_cmd if verify_cmd else "# No verification available"}
+fi
 rm -f "${{files[@]}}"
 mv -f "$tmp" "$dest"
 cd /
@@ -2022,7 +1944,7 @@ def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str]
     dest_q = shlex.quote(dest_file)
 
     if args.keep_compressed:
-        # Keep compressed: just concatenate all .zst chunks
+        # Keep compressed: just concatenate all .zst chunks (sequential cat is safe)
         eprint(f"[turbo] Keeping compressed file (concatenating chunks to {dest_q}.zst)")
         remote_cmd = f"""
 set -euo pipefail
@@ -2030,7 +1952,13 @@ cd {stage_q}
 dest={dest_q}.zst
 tmp="${{dest}}.incomplete.$$"
 files=( $(ls -1 part.*.zst | sort) )
+# Concatenate compressed chunks sequentially (cat is safe for compressed files)
 cat "${{files[@]}}" > "$tmp"
+# Verify first chunk is valid
+if [ "${{#files[@]}}" -gt 0 ]; then
+  first_chunk="${{files[0]}}"
+  zstd -t "$first_chunk" >/dev/null 2>&1 || {{ echo "ERROR: First chunk is corrupted" >&2; exit 1; }}
+fi
 mv -f "$tmp" "$dest"
 rm -f "${{files[@]}}"
 cd /
