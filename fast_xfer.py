@@ -1022,26 +1022,104 @@ set -euo pipefail
             pass
 
 
-def split_file(src: Path, part_prefix: Path, chunk_size: str) -> list[Path]:
-    if which("split") is None:
-        raise RuntimeError("Strategy 'chunked' requires 'split' installed on SOURCE.")
+def split_file(src: Path, part_prefix: Path, chunk_size: str, parallel: int = 1) -> list[Path]:
+    """
+    Split file into chunks using parallel dd (much faster than sequential split).
+    If dd is available and parallel > 1, uses parallel dd. Otherwise falls back to split.
+    """
+    src_size = src.stat().st_size
+    if src_size == 0:
+        raise RuntimeError("Source file is empty; nothing to split.")
+    
+    try:
+        chunk_bytes = parse_size_to_bytes(chunk_size)
+    except Exception as e:
+        raise RuntimeError(f"Invalid chunk_size {chunk_size!r}: {e}")
+    
+    n_chunks = (src_size + chunk_bytes - 1) // chunk_bytes
+    suffix_len = max(4, len(str(n_chunks - 1)))
     part_prefix.parent.mkdir(parents=True, exist_ok=True)
-
-    eprint(f"[chunked] Splitting {src.name} into {chunk_size} chunks...")
-    cmd = [
-        "split",
-        "-b", chunk_size,
-        "--numeric-suffixes=0",
-        "--suffix-length=4",
-        str(src),
-        str(part_prefix),
-    ]
-    run_checked(cmd)
-
-    parts = sorted(part_prefix.parent.glob(part_prefix.name + "*"))
+    
+    # Use parallel dd if available and parallel > 1, otherwise use split
+    use_parallel_dd = (which("dd") is not None and parallel > 1 and n_chunks > 1)
+    
+    if use_parallel_dd:
+        eprint(f"[chunked] Splitting {src.name} into {n_chunks} chunks using parallel dd (workers={parallel})...")
+        
+        # Choose block size for dd
+        bs_bytes = choose_block_size(chunk_bytes, max_bs=16 * 1024 * 1024)
+        
+        def split_one_chunk(idx: int) -> Path:
+            offset_bytes = idx * chunk_bytes
+            if offset_bytes >= src_size:
+                return None
+            remaining = src_size - offset_bytes
+            this_size = min(chunk_bytes, remaining)
+            
+            out_name = f"{part_prefix.name}{idx:0{suffix_len}d}"
+            out_path = part_prefix.parent / out_name
+            
+            # Calculate dd parameters
+            skip_blocks = offset_bytes // bs_bytes
+            count_blocks = (this_size + bs_bytes - 1) // bs_bytes
+            
+            # Use dd to read chunk directly from source file
+            dd_cmd = [
+                "dd",
+                f"if={str(src)}",
+                f"of={str(out_path)}",
+                f"bs={bs_bytes}",
+                f"skip={skip_blocks}",
+                f"count={count_blocks}",
+                "iflag=fullblock",
+                "status=none",
+            ]
+            
+            try:
+                subprocess.run(dd_cmd, check=True, stderr=subprocess.PIPE)
+                return out_path
+            except subprocess.CalledProcessError as e:
+                error_msg = e.stderr.decode('utf-8', errors='ignore') if e.stderr else "unknown error"
+                raise RuntimeError(f"dd failed for chunk {idx}: {error_msg}")
+        
+        # Split chunks in parallel
+        parts = []
+        start = time.time()
+        with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
+            futs = {ex.submit(split_one_chunk, i): i for i in range(n_chunks)}
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                part = fut.result()
+                if part is not None:
+                    parts.append(part)
+                if len(parts) % max(1, n_chunks // 10) == 0 or len(parts) == n_chunks:
+                    elapsed = time.time() - start
+                    eprint(f"[chunked] Split progress: {len(parts)}/{n_chunks} chunks ({elapsed:.1f}s)", end='\r')
+        
+        eprint()  # New line after progress
+        parts = sorted(parts)
+        eprint(f"[chunked] Created {len(parts)} parts in {time.time() - start:.1f}s (parallel dd)")
+    else:
+        # Fallback to sequential split
+        if which("split") is None:
+            raise RuntimeError("Strategy 'chunked' requires 'split' or 'dd' installed on SOURCE.")
+        
+        eprint(f"[chunked] Splitting {src.name} into {chunk_size} chunks (using split)...")
+        cmd = [
+            "split",
+            "-b", chunk_size,
+            "--numeric-suffixes=0",
+            "--suffix-length=4",
+            str(src),
+            str(part_prefix),
+        ]
+        run_checked(cmd)
+        
+        parts = sorted(part_prefix.parent.glob(part_prefix.name + "*"))
+        eprint(f"[chunked] Created {len(parts)} parts (sequential split)")
+    
     if not parts:
-        raise RuntimeError("split produced no parts (unexpected).")
-    eprint(f"[chunked] Created {len(parts)} parts")
+        raise RuntimeError("Split produced no parts (unexpected).")
     return parts
 
 
@@ -1260,7 +1338,7 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         cleanup_tmpdir = True
 
     part_prefix = tmpdir / "part."
-    parts = split_file(src, part_prefix, args.chunk_size)
+    parts = split_file(src, part_prefix, args.chunk_size, parallel=args.parallel)
 
     parts_to_send: list[Path] = parts
     if args.compress_chunks:
