@@ -155,7 +155,7 @@ def parse_target(target: str, default_user: Optional[str], nfs_server: Optional[
     return False, user, host, path
 
 
-def ssh_base_args(connect_timeout: int, cipher: str, control_path: Optional[str]) -> list[str]:
+def ssh_base_args(connect_timeout: int, cipher: Optional[str], control_path: Optional[str]) -> list[str]:
     args = [
         "ssh",
         "-T",
@@ -163,8 +163,10 @@ def ssh_base_args(connect_timeout: int, cipher: str, control_path: Optional[str]
         "-o", "Compression=no",
         "-o", "IPQoS=throughput",
         "-o", f"ConnectTimeout={connect_timeout}",
-        "-c", cipher,
     ]
+    # Only specify cipher if one was successfully negotiated
+    if cipher:
+        args.extend(["-c", cipher])
     if control_path:
         args += [
             "-o", "ControlMaster=auto",
@@ -174,34 +176,50 @@ def ssh_base_args(connect_timeout: int, cipher: str, control_path: Optional[str]
     return args
 
 
-def pick_ssh_cipher(user: str, host: str, connect_timeout: int, control_path: Optional[str]) -> str:
+def pick_ssh_cipher(user: str, host: str, connect_timeout: int, control_path: Optional[str]) -> Optional[str]:
     """
     Pick a fast cipher that both ends accept.
-    Tries aes128-gcm, then chacha20-poly1305.
+    Tries multiple ciphers in order of preference (fastest first).
+    Returns None if no cipher works (will let SSH auto-negotiate).
     """
-    candidates = ["aes128-gcm@openssh.com", "chacha20-poly1305@openssh.com"]
+    # Comprehensive list of ciphers in order of preference (fastest/secure first)
+    candidates = [
+        "aes128-gcm@openssh.com",      # Fast, modern
+        "aes256-gcm@openssh.com",      # Fast, modern (server supports this)
+        "chacha20-poly1305@openssh.com", # Fast, modern
+        "aes256-ctr",                  # Common, server supports this
+        "aes192-ctr",                  # Common, server supports this
+        "aes128-ctr",                  # Common fallback
+        "aes256-cbc",                  # Legacy fallback
+        "aes128-cbc",                  # Legacy fallback
+    ]
+    
     for c in candidates:
         cmd = ssh_base_args(connect_timeout, c, control_path) + [f"{user}@{host}", "true"]
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, timeout=connect_timeout)
+            eprint(f"[ssh] Selected cipher: {c}")
             return c
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             continue
-    return "aes128-gcm@openssh.com"
+    
+    # If no explicit cipher works, return None to let SSH auto-negotiate
+    eprint(f"[ssh] WARNING: Could not negotiate cipher, letting SSH auto-negotiate")
+    return None
 
 
-def ssh_cmd_str(connect_timeout: int, cipher: str, control_path: Optional[str]) -> str:
+def ssh_cmd_str(connect_timeout: int, cipher: Optional[str], control_path: Optional[str]) -> str:
     """String form for rsync -e."""
     args = ssh_base_args(connect_timeout, cipher, control_path)
     return fmt_cmd(args)
 
 
-def remote_has_cmd(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str], cmdname: str) -> bool:
+def remote_has_cmd(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], cmdname: str) -> bool:
     cmd = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", f"command -v {shlex.quote(cmdname)} >/dev/null 2>&1"]
     return subprocess.run(cmd).returncode == 0
 
 
-def remote_mkdir_p(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str], directory: str) -> None:
+def remote_mkdir_p(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], directory: str) -> None:
     directory_q = shlex.quote(directory)
     cmd = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", f"mkdir -p {directory_q}"]
     run_checked(cmd)
@@ -483,7 +501,7 @@ def local_cpu_count() -> int:
         return 4
 
 
-def remote_capture(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str], cmd: str) -> str:
+def remote_capture(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], cmd: str) -> str:
     full = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", cmd]
     p = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
@@ -491,13 +509,13 @@ def remote_capture(user: str, host: str, connect_timeout: int, cipher: str, cont
     return (p.stdout or "").strip()
 
 
-def remote_fs_type(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str], path: str) -> str:
+def remote_fs_type(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], path: str) -> str:
     # %T is filesystem type (e.g., ext4, xfs, nfs)
     cmd = f"stat -f -c %T {shlex.quote(path)} 2>/dev/null || echo unknown"
     return remote_capture(user, host, connect_timeout, cipher, control_path, cmd)
 
 
-def remote_cpu(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str]) -> int:
+def remote_cpu(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str]) -> int:
     cmd = "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4"
     out = remote_capture(user, host, connect_timeout, cipher, control_path, cmd)
     try:
@@ -1718,7 +1736,22 @@ def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str]
     stage_q = shlex.quote(stage_dir)
     dest_q = shlex.quote(dest_file)
 
-    if assemble_mode == "append":
+    if args.keep_compressed:
+        # Keep compressed: just concatenate all .zst chunks
+        eprint(f"[turbo] Keeping compressed file (concatenating chunks to {dest_q}.zst)")
+        remote_cmd = f"""
+set -euo pipefail
+cd {stage_q}
+dest={dest_q}.zst
+tmp="${{dest}}.incomplete.$$"
+files=( $(ls -1 part.*.zst | sort) )
+cat "${{files[@]}}" > "$tmp"
+mv -f "$tmp" "$dest"
+rm -f "${{files[@]}}"
+cd /
+rmdir {stage_q} 2>/dev/null || true
+"""
+    elif assemble_mode == "append":
         eprint(f"[turbo] Remote assemble mode=append (dest on NFS detected)")
         remote_cmd = f"""
 set -euo pipefail
@@ -1816,7 +1849,7 @@ def sha256sum_local(path: Path) -> str:
     return h
 
 
-def sha256sum_remote(user: str, host: str, connect_timeout: int, cipher: str, control_path: Optional[str], remote_path: str) -> str:
+def sha256sum_remote(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], remote_path: str) -> str:
     cmd = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", f"sha256sum {shlex.quote(remote_path)} | awk '{{print $1}}'"]
     out = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
     return out
