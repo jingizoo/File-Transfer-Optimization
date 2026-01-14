@@ -1,5 +1,14 @@
 #!/bin/bash
 # Example usage scenarios for fast-xfer
+#
+# COMPATIBILITY NOTES:
+# - Examples 1-248: Work with older versions (single files only)
+# - Directory support (folders) is NEW - older versions will error on directories
+# - All examples below are for SINGLE FILE transfers (compatible with older xfer)
+
+# ============================================================================
+# BASIC SINGLE FILE TRANSFERS (Compatible with older fast-xfer)
+# ============================================================================
 
 # Example 1: Basic auto transfer (remote)
 echo "Example 1: Basic auto transfer (remote)"
@@ -246,3 +255,63 @@ fast-xfer /mnt/nfs1/500gb_file.txt /mnt/nfs2/replica/ \
   --compressor zstd \
   --compression-level 3 \
   --nfs-server nfs-server.example.com
+
+# ============================================================================
+# OLDER XFER COMPATIBILITY - SINGLE FILE ONLY (No directory support)
+# ============================================================================
+# These examples work with older versions of fast-xfer that only handle single files.
+# For directory transfers, use rsync directly or upgrade to newer fast-xfer.
+
+# Example 41: OLDER XFER - Basic single file transfer (works with older versions)
+echo "Example 41: OLDER XFER - Basic single file (compatible with older fast-xfer)"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/file.txt
+
+# Example 42: OLDER XFER - Single file with compression (older behavior)
+echo "Example 42: OLDER XFER - Single file with zstd compression"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/file.txt \
+  --strategy compress \
+  --compressor zstd \
+  --compression-level 3
+
+# Example 43: OLDER XFER - Single file chunked transfer (older behavior)
+echo "Example 43: OLDER XFER - Single file chunked with zstd compression"
+fast-xfer /data/hugefile.txt user@10.0.0.15:/data/replica/hugefile.txt \
+  --strategy chunked \
+  --compress-chunks \
+  --compressor zstd \
+  --compression-level 3 \
+  --chunk-size 20G \
+  --parallel 8 \
+  --keep-compressed
+
+# Example 44: OLDER XFER - Single file stream transfer (older behavior)
+echo "Example 44: OLDER XFER - Single file stream with zstd"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/file.txt \
+  --strategy stream \
+  --compressor zstd \
+  --compression-level 3 \
+  --keep-compressed
+
+# Example 45: OLDER XFER - Single file turbo strategy (zstd only, older behavior)
+echo "Example 45: OLDER XFER - Single file turbo strategy with zstd"
+fast-xfer /data/hugefile.txt user@10.0.0.15:/data/replica/hugefile.txt \
+  --strategy turbo \
+  --compressor zstd \
+  --compression-level 3 \
+  --chunk-size 20G \
+  --parallel 8 \
+  --keep-compressed
+
+# Example 46: OLDER XFER - Single file without compression (max parallel, older behavior)
+echo "Example 46: OLDER XFER - Single file without compression, max parallel"
+fast-xfer /data/file.txt user@10.0.0.15:/data/replica/file.txt \
+  --strategy chunked \
+  --parallel 16 \
+  --chunk-size 20G \
+  --assemble-parallel 8
+
+# ============================================================================
+# NOTE: Directory transfers are NEW and require newer fast-xfer version
+# For older versions, use rsync directly for directories:
+#   rsync -rtvh --info=progress2 /src_dir/ user@host:/dest_dir/
+# ============================================================================
