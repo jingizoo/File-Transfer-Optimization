@@ -663,6 +663,72 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
         run_stream(cmd)
 
 
+def strategy_dir_rsync(
+    args: argparse.Namespace,
+    is_local: bool,
+    user: Optional[str],
+    host: Optional[str],
+    target_path: str,
+    ssh_e: Optional[str],
+) -> None:
+    """
+    Directory transfer strategy: use rsync to copy an entire directory tree (including nested folders).
+
+    Semantics:
+      - Copies *contents* of the source directory into the target path (like: rsync src_dir/ dest_dir/)
+      - Works for both local and remote targets
+      - Re-uses rsync compression flags if enabled via --rsync-compress
+    """
+    src = Path(args.source).resolve()
+    if not src.is_dir():
+        raise RuntimeError("strategy_dir_rsync called but source is not a directory")
+
+    # rsync-style: src/ means "contents of src"
+    src_arg = str(src)
+    if not src_arg.endswith("/"):
+        src_arg = src_arg + "/"
+
+    dest_root = target_path
+    # Ensure dest_root is treated as a directory
+    if dest_root.endswith("/"):
+        dest_root = dest_root.rstrip("/")
+    dest_dir_arg = dest_root + "/"
+
+    if is_local:
+        # Local rsync (no ssh)
+        dest_arg = dest_dir_arg
+    else:
+        assert user is not None and host is not None, "user and host must be set for remote directory transfers"
+        dest_arg = f"{user}@{host}:{dest_dir_arg}"
+
+    use_rsync_compress = args.rsync_compress if hasattr(args, "rsync_compress") else False
+    rsync_comp_level = args.rsync_compress_level if hasattr(args, "rsync_compress_level") else 1
+
+    # For directories we don't use append_only/whole_file/inplace/preallocate; rsync handles trees efficiently.
+    cmd = build_rsync_cmd(
+        src_arg,
+        dest_arg,
+        ssh_e,
+        append_only=False,
+        whole_file=False,
+        inplace=False,
+        preallocate=False,
+        timeout=args.rsync_timeout,
+        rsync_compress=use_rsync_compress,
+        rsync_compress_level=rsync_comp_level,
+    )
+
+    if is_local:
+        eprint(f"[dir] Using rsync for local directory copy: {src_arg} -> {dest_root}/")
+    else:
+        if use_rsync_compress:
+            eprint(f"[dir] Using rsync with built-in compression (level {rsync_comp_level}) for directory transfer")
+        else:
+            eprint(f"[dir] Using rsync for remote directory transfer: {src_arg} -> {dest_root}/ on {user}@{host}")
+
+    run_stream(cmd)
+
+
 def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
     """Stream compression: compress and transfer simultaneously (no pre-compression wait)"""
     compressor = args.compressor
@@ -2125,8 +2191,8 @@ def main() -> int:
             args.compression_level = args.zstd_level
 
     src = args.source.resolve()
-    if not src.exists() or not src.is_file():
-        eprint(f"ERROR: source file not found: {src}")
+    if not src.exists() or (not src.is_file() and not src.is_dir()):
+        eprint(f"ERROR: source path not found or unsupported type (must be file or directory): {src}")
         return 2
 
     if which("rsync") is None:
@@ -2134,7 +2200,7 @@ def main() -> int:
         return 2
 
     is_local, user, host, target_path = parse_target(args.target, args.user, nfs_server=getattr(args, 'nfs_server', None))
-    dest_dir, dest_file = normalize_dest_path(target_path, src)
+    dest_dir, dest_file = normalize_dest_path(target_path, src if src.is_file() else Path(src.name))
 
     # For local transfers, we don't need SSH
     if is_local:
@@ -2221,36 +2287,52 @@ def main() -> int:
                     strategy = "direct"
 
     start = time.time()
-    if is_local:
-        eprint(f"=== Strategy: {strategy} | src={src} -> {dest_file} (local) ===")
+    if src.is_dir():
+        # Directory mode: always use rsync-based directory transfer, ignore other strategies.
+        if strategy not in ("direct", "auto"):
+            eprint(f"[dir] WARNING: Source is a directory; ignoring --strategy={strategy!r} and using rsync directory transfer")
+        if is_local:
+            eprint(f"=== Directory transfer (rsync) | src={src}/ -> {target_path} (local) ===")
+        else:
+            eprint(f"=== Directory transfer (rsync) | src={src}/ -> {user}@{host}:{target_path} ===")
     else:
-        eprint(f"=== Strategy: {strategy} | src={src} -> {user}@{host}:{dest_file} ===")
+        if is_local:
+            eprint(f"=== Strategy: {strategy} | src={src} -> {dest_file} (local) ===")
+        else:
+            eprint(f"=== Strategy: {strategy} | src={src} -> {user}@{host}:{dest_file} ===")
 
     try:
-        if strategy == "direct":
-            strategy_direct(args, is_local, user, host, dest_file, ssh_e)
-        elif strategy == "compress":
-            strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
-        elif strategy == "stream":
-            strategy_stream_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
-        elif strategy == "chunked":
-            strategy_chunked(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
-        elif strategy == "turbo":
-            strategy_turbo(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
+        if src.is_dir():
+            # Directory tree transfer
+            strategy_dir_rsync(args, is_local, user, host, target_path, ssh_e)
+            if args.verify_sha256:
+                eprint("[dir] NOTE: --verify-sha256 is not implemented for directory transfers; skipping integrity check")
         else:
-            raise RuntimeError(f"Unknown strategy: {strategy}")
-
-        if args.verify_sha256:
-            eprint("=== Verifying sha256 (this will read the full file on both ends) ===")
-            local_h = sha256sum_local(src)
-            if is_local:
-                remote_h = sha256sum_local_path(dest_file)
+            # Single-file transfer strategies
+            if strategy == "direct":
+                strategy_direct(args, is_local, user, host, dest_file, ssh_e)
+            elif strategy == "compress":
+                strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+            elif strategy == "stream":
+                strategy_stream_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+            elif strategy == "chunked":
+                strategy_chunked(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
+            elif strategy == "turbo":
+                strategy_turbo(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
             else:
-                remote_h = sha256sum_remote(user, host, args.connect_timeout, cipher, control_path, dest_file)
-            eprint(f"source sha256:  {local_h}")
-            eprint(f"dest sha256:    {remote_h}")
-            if local_h != remote_h:
-                raise RuntimeError("sha256 mismatch: transfer may be corrupted")
+                raise RuntimeError(f"Unknown strategy: {strategy}")
+
+            if args.verify_sha256:
+                eprint("=== Verifying sha256 (this will read the full file on both ends) ===")
+                local_h = sha256sum_local(src)
+                if is_local:
+                    remote_h = sha256sum_local_path(dest_file)
+                else:
+                    remote_h = sha256sum_remote(user, host, args.connect_timeout, cipher, control_path, dest_file)
+                eprint(f"source sha256:  {local_h}")
+                eprint(f"dest sha256:    {remote_h}")
+                if local_h != remote_h:
+                    raise RuntimeError("sha256 mismatch: transfer may be corrupted")
 
         elapsed = time.time() - start
         eprint(f"=== Done in {elapsed:.1f}s ===")
