@@ -259,19 +259,18 @@ def decompress_file_python_zstd(src: Path, dst: Path, threads: int = 0) -> None:
 def get_compressor_cmd(compressor: str, prefer_python: bool = True) -> Optional[Tuple[str, str, str]]:
     """
     Returns (compress_cmd, decompress_cmd, extension) for the given compressor.
-    For zstd, can use Python zstandard library if available (prefer_python=True).
-    Returns None if compressor is not available.
+    For zstd, we *prefer* the Python zstandard library when available, but we never
+    return a fake binary name like "python_zstd". We always return the logical
+    CLI name ("zstd") and let higher-level code decide whether to call the CLI
+    or use the Python library (HAS_ZSTD_LIB).
+
+    Returns None if the compressor is not available at all (no CLI and no Python lib).
     """
     if compressor == "zstd":
-        # Try Python zstandard library first if available and preferred
-        if prefer_python and HAS_ZSTD_LIB:
-            return ("python_zstd", "python_zstd", ".zst")
-        # Fallback to CLI zstd
-        if which("zstd"):
+        # If we have either the Python library OR the CLI, report zstd as available.
+        if HAS_ZSTD_LIB or which("zstd"):
             return ("zstd", "zstd", ".zst")
-        # If CLI not available but Python lib is, use Python lib
-        if HAS_ZSTD_LIB:
-            return ("python_zstd", "python_zstd", ".zst")
+        # Neither Python zstandard nor CLI zstd is available.
         return None
     elif compressor == "pigz":
         if which("pigz"):
@@ -304,13 +303,14 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
 
     # Build compression command based on algorithm
     if compressor == "zstd":
-        if comp_cmd == "python_zstd":
-            # Use Python zstandard library for estimation (much faster, no subprocess overhead)
+        # Prefer Python zstandard library for estimation when available
+        if HAS_ZSTD_LIB:
             try:
                 import multiprocessing
                 threads = multiprocessing.cpu_count()
-            except:
+            except Exception:
                 threads = 4
+
             cctx = zstd_lib.ZstdCompressor(level=level, threads=threads)
             start_time = time.time()
             with src.open("rb") as f:
@@ -331,7 +331,7 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
             ratio = out_bytes / in_bytes
             return ratio, in_bytes, out_bytes
         else:
-            # Use CLI zstd
+            # Fallback to CLI zstd
             cmd = [comp_cmd, f"-{level}", "-T0", "-c", "--no-progress"]
     elif compressor == "pigz":
         # pigz: use default threads for sampling (omit -p for auto)
@@ -1032,8 +1032,21 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
     comp_start = time.time()
     
     if compressor == "zstd":
-        cmd = [comp_cmd, f"-{comp_level}", "-T0", "--no-progress", "-o", str(comp_local), str(src)]
-        run_stream(cmd)
+        if HAS_ZSTD_LIB:
+            # Use Python zstandard library for local compression (no external zstd needed)
+            threads = getattr(args, "compression_threads", 0) or 0
+            if threads <= 0:
+                try:
+                    import multiprocessing
+                    threads = multiprocessing.cpu_count()
+                except Exception:
+                    threads = 4
+            eprint(f"[compress] Using Python zstandard library with {threads} threads...")
+            compress_file_python_zstd(src, comp_local, comp_level, threads)
+        else:
+            # Fallback to CLI zstd
+            cmd = [comp_cmd, f"-{comp_level}", "-T0", "--no-progress", "-o", str(comp_local), str(src)]
+            run_stream(cmd)
     elif compressor == "pigz":
         threads = args.compression_threads if hasattr(args, 'compression_threads') and args.compression_threads > 0 else 0
         # Auto-detect threads if not specified (use CPU count)
@@ -1282,8 +1295,8 @@ def compress_parts(parts: List[Path], compressor: str, level: int, parallel: int
         comp_file = Path(str(p) + ext)
         
         if compressor == "zstd":
-            if comp_cmd == "python_zstd":
-                # Use Python zstandard library
+            if HAS_ZSTD_LIB:
+                # Use Python zstandard library for per-chunk compression
                 compress_file_python_zstd(p, comp_file, level, comp_threads)
             else:
                 # Use CLI zstd
