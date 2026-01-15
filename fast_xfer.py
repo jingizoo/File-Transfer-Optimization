@@ -16,7 +16,11 @@ Optional:
   - split on source (for chunked strategy)
 """
 
-from __future__ import annotations
+# Python 3.7+ feature: postponed evaluation of annotations
+# For Python 3.6 compatibility, we'll use string annotations where needed
+import sys
+if sys.version_info >= (3, 7):
+    from __future__ import annotations
 
 import argparse
 import os
@@ -25,13 +29,12 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # Try to import select for non-blocking I/O (Unix only)
 try:
@@ -40,6 +43,14 @@ try:
 except ImportError:
     HAS_SELECT = False
     select = None
+
+# Try to import Python zstandard library (optional, falls back to CLI)
+try:
+    import zstandard as zstd_lib
+    HAS_ZSTD_LIB = True
+except ImportError:
+    HAS_ZSTD_LIB = False
+    zstd_lib = None
 
 
 def eprint(*args: object, **kwargs) -> None:
@@ -54,7 +65,7 @@ def fmt_cmd(cmd: Iterable[str]) -> str:
     return " ".join(shlex.quote(c) for c in cmd)
 
 
-def run_checked(cmd: list[str], *, capture: bool = False, env: Optional[dict[str, str]] = None) -> str:
+def run_checked(cmd: List[str], *, capture: bool = False, env: Optional[Dict[str, str]] = None) -> str:
     eprint("+", fmt_cmd(cmd))
     if capture:
         p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
@@ -63,7 +74,7 @@ def run_checked(cmd: list[str], *, capture: bool = False, env: Optional[dict[str
     return ""
 
 
-def run_stream(cmd: list[str], *, env: Optional[dict[str, str]] = None) -> None:
+def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None) -> None:
     """Run a command and stream combined stdout/stderr to our stdout."""
     eprint("+", fmt_cmd(cmd))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
@@ -155,7 +166,7 @@ def parse_target(target: str, default_user: Optional[str], nfs_server: Optional[
     return False, user, host, path
 
 
-def ssh_base_args(connect_timeout: int, cipher: Optional[str], control_path: Optional[str]) -> list[str]:
+def ssh_base_args(connect_timeout: int, cipher: Optional[str], control_path: Optional[str]) -> List[str]:
     args = [
         "ssh",
         "-T",
@@ -225,14 +236,44 @@ def remote_mkdir_p(user: str, host: str, connect_timeout: int, cipher: Optional[
     run_checked(cmd)
 
 
-def get_compressor_cmd(compressor: str) -> Optional[tuple[str, str, str]]:
+def compress_file_python_zstd(src: Path, dst: Path, level: int, threads: int = 0) -> None:
+    """Compress file using Python zstandard library."""
+    if not HAS_ZSTD_LIB:
+        raise RuntimeError("Python zstandard library not available. Install with: pip install zstandard")
+    
+    cctx = zstd_lib.ZstdCompressor(level=level, threads=threads if threads > 0 else None)
+    
+    with open(src, "rb") as infile, open(dst, "wb") as outfile:
+        cctx.copy_stream(infile, outfile)
+
+
+def decompress_file_python_zstd(src: Path, dst: Path, threads: int = 0) -> None:
+    """Decompress file using Python zstandard library."""
+    if not HAS_ZSTD_LIB:
+        raise RuntimeError("Python zstandard library not available. Install with: pip install zstandard")
+    
+    dctx = zstd_lib.ZstdDecompressor(threads=threads if threads > 0 else None)
+    
+    with open(src, "rb") as infile, open(dst, "wb") as outfile:
+        dctx.copy_stream(infile, outfile)
+
+
+def get_compressor_cmd(compressor: str, prefer_python: bool = True) -> Optional[Tuple[str, str, str]]:
     """
     Returns (compress_cmd, decompress_cmd, extension) for the given compressor.
+    For zstd, can use Python zstandard library if available (prefer_python=True).
     Returns None if compressor is not available.
     """
     if compressor == "zstd":
+        # Try Python zstandard library first if available and preferred
+        if prefer_python and HAS_ZSTD_LIB:
+            return ("python_zstd", "python_zstd", ".zst")
+        # Fallback to CLI zstd
         if which("zstd"):
             return ("zstd", "zstd", ".zst")
+        # If CLI not available but Python lib is, use Python lib
+        if HAS_ZSTD_LIB:
+            return ("python_zstd", "python_zstd", ".zst")
         return None
     elif compressor == "pigz":
         if which("pigz"):
@@ -265,7 +306,35 @@ def estimate_compression_ratio(src: Path, compressor: str, level: int, sample_by
 
     # Build compression command based on algorithm
     if compressor == "zstd":
-        cmd = [comp_cmd, f"-{level}", "-T0", "-c", "--no-progress"]
+        if comp_cmd == "python_zstd":
+            # Use Python zstandard library for estimation (much faster, no subprocess overhead)
+            try:
+                import multiprocessing
+                threads = multiprocessing.cpu_count()
+            except:
+                threads = 4
+            cctx = zstd_lib.ZstdCompressor(level=level, threads=threads)
+            start_time = time.time()
+            with src.open("rb") as f:
+                remaining = sample_bytes
+                while remaining > 0:
+                    if time.time() - start_time > timeout:
+                        eprint(f"[estimate] Timeout after {timeout}s, skipping compression estimation")
+                        break
+                    chunk = f.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    in_bytes += len(chunk)
+                    compressed = cctx.compress(chunk)
+                    out_bytes += len(compressed)
+                    remaining -= len(chunk)
+            if in_bytes == 0:
+                return None
+            ratio = out_bytes / in_bytes
+            return ratio, in_bytes, out_bytes
+        else:
+            # Use CLI zstd
+            cmd = [comp_cmd, f"-{level}", "-T0", "-c", "--no-progress"]
     elif compressor == "pigz":
         # pigz: use default threads for sampling (omit -p for auto)
         cmd = [comp_cmd, f"-{level}", "-c"]
@@ -581,7 +650,7 @@ def build_rsync_cmd(
     rsync_compress: bool = False,
     rsync_compress_level: int = 1,
 ) -> list[str]:
-    cmd: list[str] = [
+    cmd: List[str] = [
         "rsync",
         "-rtvh",
         "--info=progress2",
@@ -1088,7 +1157,7 @@ set -euo pipefail
             pass
 
 
-def split_file(src: Path, part_prefix: Path, chunk_size: str, parallel: int = 1) -> list[Path]:
+def split_file(src: Path, part_prefix: Path, chunk_size: str, parallel: int = 1) -> List[Path]:
     """
     Split file into chunks using parallel dd (much faster than sequential split).
     If dd is available and parallel > 1, uses parallel dd. Otherwise falls back to split.
@@ -1189,7 +1258,7 @@ def split_file(src: Path, part_prefix: Path, chunk_size: str, parallel: int = 1)
     return parts
 
 
-def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int, keep_parts: bool, compression_threads: Optional[int] = None) -> list[Path]:
+def compress_parts(parts: List[Path], compressor: str, level: int, parallel: int, keep_parts: bool, compression_threads: Optional[int] = None) -> List[Path]:
     comp_info = get_compressor_cmd(compressor)
     if not comp_info:
         raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
@@ -1215,7 +1284,12 @@ def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int
         comp_file = Path(str(p) + ext)
         
         if compressor == "zstd":
-            run_checked([comp_cmd, f"-{level}", f"-T{comp_threads}", "--no-progress", "-o", str(comp_file), str(p)])
+            if comp_cmd == "python_zstd":
+                # Use Python zstandard library
+                compress_file_python_zstd(p, comp_file, level, comp_threads)
+            else:
+                # Use CLI zstd
+                run_checked([comp_cmd, f"-{level}", f"-T{comp_threads}", "--no-progress", "-o", str(comp_file), str(p)])
         elif compressor == "pigz":
             # pigz -c reads from stdin, so redirect input
             cmd = [comp_cmd, f"-{level}", "-p", str(comp_threads), "-c"]
@@ -1244,7 +1318,7 @@ def compress_parts(parts: list[Path], compressor: str, level: int, parallel: int
 
 
 def rsync_many_parallel(
-    files: list[Path],
+    files: List[Path],
     is_local: bool,
     user: Optional[str],
     host: Optional[str],
@@ -1262,7 +1336,7 @@ def rsync_many_parallel(
         
         eprint(f"[chunked] Copying {len(files)} files in parallel (workers={parallel})...")
         
-        def copy_one(p: Path) -> tuple[Path, bool, Optional[str]]:
+        def copy_one(p: Path) -> Tuple[Path, bool, Optional[str]]:
             """Returns (file_path, success, error_message)"""
             try:
                 dest_file = dest_path / p.name
@@ -1323,7 +1397,7 @@ def rsync_many_parallel(
 
     eprint(f"[chunked] Transferring {len(files)} files in parallel (workers={parallel})...")
 
-    def send_one(p: Path) -> tuple[Path, bool, Optional[str]]:
+    def send_one(p: Path) -> Tuple[Path, bool, Optional[str]]:
         """Returns (file_path, success, error_message)"""
         cmd = [
             "rsync",
@@ -1419,7 +1493,7 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
     part_prefix = tmpdir / "part."
     parts = split_file(src, part_prefix, args.chunk_size, parallel=args.parallel)
 
-    parts_to_send: list[Path] = parts
+    parts_to_send: List[Path] = parts
     if args.compress_chunks:
         compressor = args.compressor
         comp_info = get_compressor_cmd(compressor)
