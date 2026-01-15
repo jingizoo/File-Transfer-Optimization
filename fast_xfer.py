@@ -16,13 +16,11 @@ Optional:
   - split on source (for chunked strategy)
 """
 
-# Python 3.7+ feature: postponed evaluation of annotations
-# For Python 3.6 compatibility, we'll use string annotations where needed
-import sys
-if sys.version_info >= (3, 7):
-    from __future__ import annotations
+# Note: We use typing.List, typing.Dict, typing.Tuple for Python 3.6 compatibility
+# instead of from __future__ import annotations (which requires Python 3.7+)
 
 import argparse
+import sys
 import os
 import queue
 import re
