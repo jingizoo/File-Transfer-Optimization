@@ -1,9 +1,74 @@
-# fast-xfer uses only Python standard library
-# No external Python dependencies required
+# fast-xfer Python Dependencies
+# ================================
 #
-# System dependencies (install via package manager):
-# - ssh (OpenSSH)
-# - rsync
-# - zstd (optional, for compression strategies)
-# - split (optional, for chunked strategy)
-
+# REQUIRED: None! All Python dependencies are in the standard library.
+# Compatible with Python 3.6+
+#
+# RECOMMENDED (for Python-based zstd compression, NO SUDO NEEDED):
+# This allows compression without installing system packages like zstd/pigz!
+zstandard>=0.18.0; python_version >= "3.6"
+#
+# To install (NO SUDO REQUIRED):
+#   pip3 install --user zstandard
+#   OR
+#   pip3 install zstandard
+#
+# With this package, you get:
+#   - Full zstd compression/decompression in Python
+#   - No need for system zstd, pigz, or gzip packages
+#   - Works without sudo access!
+#
+# ================================
+# System Dependencies (install via package manager)
+# ================================
+#
+# REQUIRED:
+#   - rsync (for all transfers)
+#   - ssh (OpenSSH, for remote transfers only)
+#
+# OPTIONAL (for compression strategies):
+#   - zstd (CLI tool, OR use Python zstandard library above)
+#   - pigz (parallel gzip, recommended - fastest)
+#   - gzip (fallback, usually pre-installed)
+#
+# OPTIONAL (for chunked strategy):
+#   - split (usually pre-installed on Linux)
+#   - dd (usually pre-installed on Linux)
+#   - xargs (usually pre-installed on Linux)
+#
+# ================================
+# Installation Commands by OS
+# ================================
+#
+# Ubuntu/Debian:
+#   sudo apt-get update
+#   sudo apt-get install -y rsync openssh-client zstd pigz
+#
+# CentOS/RHEL/Fedora:
+#   sudo yum install -y rsync openssh-clients zstd pigz
+#   # OR for newer versions:
+#   sudo dnf install -y rsync openssh-clients zstd pigz
+#
+# macOS (via Homebrew):
+#   brew install rsync zstd pigz
+#   # SSH is pre-installed on macOS
+#
+# Arch Linux:
+#   sudo pacman -S rsync openssh zstd pigz
+#
+# ================================
+# Quick Install (Python + System)
+# ================================
+#
+# 1. Install Python package (optional, for Python zstd):
+#    pip3 install zstandard
+#
+# 2. Install system packages (Ubuntu/Debian example):
+#    sudo apt-get update && sudo apt-get install -y rsync openssh-client zstd pigz
+#
+# 3. Test installation:
+#    python3 fast_xfer.py --help
+#    rsync --version
+#    ssh -V
+#    zstd --version  # Optional
+#    pigz --version  # Optional

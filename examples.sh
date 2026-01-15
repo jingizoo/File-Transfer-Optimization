@@ -346,3 +346,41 @@ fast-xfer /data/file.txt user@10.0.0.15:/data/replica/file.txt \
 # For older versions, use rsync directly for directories:
 #   rsync -rtvh --info=progress2 /src_dir/ user@host:/dest_dir/
 # ============================================================================
+
+# ============================================================================
+# QUICK TEST COMMANDS (No Sudo Required - Uses Python zstandard)
+# ============================================================================
+
+# Test 1: Verify Python zstandard is installed
+echo "Test 1: Check Python zstandard"
+python3 -c "import zstandard; print('✓ Python zstandard OK')" || echo "Install with: pip3 install --user zstandard"
+
+# Test 2: Create a test file and transfer locally with Python zstd
+echo "Test 2: Local transfer with Python zstd compression"
+echo "Test content for compression" > /tmp/test_fast_xfer.txt
+fast-xfer /tmp/test_fast_xfer.txt /tmp/test_fast_xfer_copy.txt \
+  --strategy compress \
+  --compressor zstd \
+  --compression-level 3
+
+# Test 3: Verify the transfer worked
+echo "Test 3: Verify files match"
+diff /tmp/test_fast_xfer.txt /tmp/test_fast_xfer_copy.txt && echo "✓ Files match!" || echo "✗ Files differ!"
+
+# Test 4: Test auto strategy
+echo "Test 4: Auto strategy with Python zstd"
+fast-xfer /tmp/test_fast_xfer.txt /tmp/test_fast_xfer_auto.txt \
+  --strategy auto \
+  --compressor zstd
+
+# Test 5: Test keep-compressed
+echo "Test 5: Keep compressed file"
+fast-xfer /tmp/test_fast_xfer.txt /tmp/test_compressed.zst \
+  --strategy compress \
+  --compressor zstd \
+  --keep-compressed
+
+# Cleanup
+echo "Cleanup: Remove test files"
+rm -f /tmp/test_fast_xfer*.txt /tmp/test_compressed.zst
+echo "✓ All tests complete!"
