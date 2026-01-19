@@ -775,38 +775,60 @@ def strategy_dir_rsync(
     use_rsync_compress = args.rsync_compress if hasattr(args, "rsync_compress") else False
     rsync_comp_level = args.rsync_compress_level if hasattr(args, "rsync_compress_level") else 1
 
-    # Optional: only transfer files older/newer than a given cutoff date (by mtime)
-    # --before-date uses rsync --min-age=SECONDS (keep only OLDER than cutoff)
-    # --after-date  uses rsync --max-age=SECONDS (keep only NEWER than cutoff)
+    # Optional: only transfer files older/newer than a given cutoff date (by mtime).
+    # We implement this in Python by building a filtered file list and passing it
+    # to rsync via --files-from, so it works even on older rsync versions.
     extra_rsync_args: List[str] = []
     before_date_str = getattr(args, "before_date", None)
     after_date_str = getattr(args, "after_date", None)
     if before_date_str and after_date_str:
         raise RuntimeError("Use only ONE of --before-date or --after-date (they are mutually exclusive).")
-    if before_date_str:
+
+    files_from_path: Optional[str] = None
+    if before_date_str or after_date_str:
         try:
-            cutoff = datetime.datetime.strptime(before_date_str, "%Y-%m-%d")
-            now = datetime.datetime.now()
-            age_seconds = int((now - cutoff).total_seconds())
-            if age_seconds < 0:
-                age_seconds = 0
-            # --min-age=SECONDS: skip files that are newer than SECONDS (keep only older)
-            extra_rsync_args.append(f"--min-age={age_seconds}")
-            eprint(f"[dir] Filtering: only transferring files with mtime BEFORE {before_date_str} (age >= {age_seconds}s)")
+            cutoff = datetime.datetime.strptime(
+                before_date_str or after_date_str, "%Y-%m-%d"
+            )
         except Exception as e:
-            raise RuntimeError(f"Invalid --before-date {before_date_str!r}: {e}")
-    elif after_date_str:
-        try:
-            cutoff = datetime.datetime.strptime(after_date_str, "%Y-%m-%d")
-            now = datetime.datetime.now()
-            age_seconds = int((now - cutoff).total_seconds())
-            if age_seconds < 0:
-                age_seconds = 0
-            # --max-age=SECONDS: skip files that are older than SECONDS (keep only newer)
-            extra_rsync_args.append(f"--max-age={age_seconds}")
-            eprint(f"[dir] Filtering: only transferring files with mtime AFTER {after_date_str} (age <= {age_seconds}s)")
-        except Exception as e:
-            raise RuntimeError(f"Invalid --after-date {after_date_str!r}: {e}")
+            flag = "--before-date" if before_date_str else "--after-date"
+            val = before_date_str or after_date_str
+            raise RuntimeError(f"Invalid {flag} {val!r}: {e}")
+
+        # Walk directory and select files based on mtime
+        selected: List[Path] = []
+        for root, _dirs, files in os.walk(src):
+            root_path = Path(root)
+            for name in files:
+                p = root_path / name
+                try:
+                    mtime = datetime.datetime.fromtimestamp(p.stat().st_mtime)
+                except OSError:
+                    continue
+                if before_date_str and mtime < cutoff:
+                    selected.append(p)
+                elif after_date_str and mtime > cutoff:
+                    selected.append(p)
+
+        if not selected:
+            if before_date_str:
+                eprint(f"[dir] Filtering: no files found with mtime BEFORE {before_date_str}")
+            else:
+                eprint(f"[dir] Filtering: no files found with mtime AFTER {after_date_str}")
+            return
+
+        # Build a temporary --files-from list with paths relative to src root
+        fd, files_from_path = tempfile.mkstemp(prefix="xfer_files_", suffix=".list")
+        with os.fdopen(fd, "w") as f:
+            for p in selected:
+                rel = p.relative_to(src)
+                f.write(str(rel).replace("\\", "/") + "\n")
+
+        extra_rsync_args.append(f"--files-from={files_from_path}")
+        if before_date_str:
+            eprint(f"[dir] Filtering: transferring {len(selected)} files with mtime BEFORE {before_date_str}")
+        else:
+            eprint(f"[dir] Filtering: transferring {len(selected)} files with mtime AFTER {after_date_str}")
 
     # For directories we don't use append_only/whole_file/inplace/preallocate; rsync handles trees efficiently.
     cmd = build_rsync_cmd(
@@ -831,7 +853,15 @@ def strategy_dir_rsync(
         else:
             eprint(f"[dir] Using rsync for remote directory transfer: {src_arg} -> {dest_root}/ on {user}@{host}")
 
-    run_stream(cmd)
+    try:
+        run_stream(cmd)
+    finally:
+        # Cleanup temporary files-from list, if any
+        if files_from_path:
+            try:
+                os.remove(files_from_path)
+            except OSError:
+                pass
 
 
 def strategy_stream_compress(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
@@ -2304,12 +2334,12 @@ def main() -> int:
     p.add_argument(
         "--before-date",
         default=None,
-        help="Directory mode ONLY: only transfer files whose modification time is BEFORE this date (YYYY-MM-DD, requires rsync 3.2+ for --min-age).",
+        help="Directory mode ONLY: only transfer files whose modification time is BEFORE this date (YYYY-MM-DD).",
     )
     p.add_argument(
         "--after-date",
         default=None,
-        help="Directory mode ONLY: only transfer files whose modification time is AFTER this date (YYYY-MM-DD, requires rsync 3.2+ for --max-age).",
+        help="Directory mode ONLY: only transfer files whose modification time is AFTER this date (YYYY-MM-DD).",
     )
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
 
