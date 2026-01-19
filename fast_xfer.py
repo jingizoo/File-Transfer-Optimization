@@ -30,6 +30,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -647,7 +648,8 @@ def build_rsync_cmd(
     timeout: int,
     rsync_compress: bool = False,
     rsync_compress_level: int = 1,
-) -> list[str]:
+    extra_args: Optional[List[str]] = None,
+) -> List[str]:
     cmd: List[str] = [
         "rsync",
         "-rtvh",
@@ -672,6 +674,8 @@ def build_rsync_cmd(
         cmd.append("--append-verify")
     elif whole_file:
         cmd.append("--whole-file")
+    if extra_args:
+        cmd.extend(extra_args)
     cmd += [src, dest]
     return cmd
 
@@ -771,6 +775,23 @@ def strategy_dir_rsync(
     use_rsync_compress = args.rsync_compress if hasattr(args, "rsync_compress") else False
     rsync_comp_level = args.rsync_compress_level if hasattr(args, "rsync_compress_level") else 1
 
+    # Optional: only transfer files older than a given cutoff date (by mtime)
+    # --before-date uses rsync --min-age=SECONDS (requires rsync 3.2+).
+    extra_rsync_args: List[str] = []
+    before_date_str = getattr(args, "before_date", None)
+    if before_date_str:
+        try:
+            cutoff = datetime.datetime.strptime(before_date_str, "%Y-%m-%d")
+            now = datetime.datetime.now()
+            age_seconds = int((now - cutoff).total_seconds())
+            if age_seconds < 0:
+                age_seconds = 0
+            # --min-age=SECONDS: skip files that are newer than SECONDS (keep only older)
+            extra_rsync_args.append(f"--min-age={age_seconds}")
+            eprint(f"[dir] Filtering: only transferring files with mtime before {before_date_str} (age >= {age_seconds}s)")
+        except Exception as e:
+            raise RuntimeError(f"Invalid --before-date {before_date_str!r}: {e}")
+
     # For directories we don't use append_only/whole_file/inplace/preallocate; rsync handles trees efficiently.
     cmd = build_rsync_cmd(
         src_arg,
@@ -783,6 +804,7 @@ def strategy_dir_rsync(
         timeout=args.rsync_timeout,
         rsync_compress=use_rsync_compress,
         rsync_compress_level=rsync_comp_level,
+        extra_args=extra_rsync_args or None,
     )
 
     if is_local:
@@ -2263,6 +2285,11 @@ def main() -> int:
     p.add_argument("--temp-dir", default=None, help="Temporary directory for SSH control sockets (default: system temp, respects TMPDIR env var)")
     p.add_argument("--rsync-compress", action="store_true", help="Use rsync's built-in compression (compresses on-the-fly during transfer, more efficient than pre-compression)")
     p.add_argument("--rsync-compress-level", type=int, default=1, help="rsync compression level (1=fast, 6=better ratio, default: 1)")
+    p.add_argument(
+        "--before-date",
+        default=None,
+        help="Directory mode ONLY: only transfer files whose modification time is BEFORE this date (YYYY-MM-DD, requires rsync 3.2+ for --min-age).",
+    )
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
 
     args = p.parse_args()

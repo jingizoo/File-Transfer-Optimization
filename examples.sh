@@ -283,9 +283,12 @@ fast-xfer /data/folder/ user@10.0.0.15:/data/backup_zstd/
 
 # Example 45: Directory - per-file zstd, then decompress on destination
 echo "Example 45: Directory per-file zstd, then decompress on destination"
-echo "  On destination:"
+echo "  Method 1 (CLI zstd - fastest if available):"
 echo "    cd /data/backup_zstd"
 echo "    find . -type f -name '*.zst' -print0 | xargs -0 -P 8 -I{} zstd -T0 -d --rm \"{}\""
+echo "  Method 2 (Python - no sudo required):"
+echo "    python3 decompress_dir.py /data/backup_zstd --parallel 8"
+echo "  See DECOMPRESS_DIRECTORIES.md for full guide with all methods"
 
 # ============================================================================
 # OLDER XFER COMPATIBILITY - SINGLE FILE ONLY (No directory support)
