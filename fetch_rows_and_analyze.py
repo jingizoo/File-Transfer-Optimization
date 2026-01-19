@@ -45,6 +45,7 @@ def main():
 
     processed = 0
     t0 = time.time()
+    last_log = t0
 
     # buffer for DuckDB inserts
     out_rows = []
@@ -69,9 +70,16 @@ def main():
                 ddb.commit()
                 out_rows.clear()
 
-        if processed % (FETCH_BATCH * 50) == 0:  # periodic progress
-            elapsed = time.time() - t0
-            print(f"processed={processed:,} rows  elapsed={elapsed:.1f}s  rate={processed/elapsed:,.0f} rows/s")
+        # periodic progress (time-based, so you always see updates)
+        now = time.time()
+        if now - last_log >= 5.0:  # log roughly every 5 seconds
+            elapsed = now - t0
+            rate = processed / elapsed if elapsed > 0 else 0
+            print(
+                f"processed={processed:,} rows  elapsed={elapsed:.1f}s  rate={rate:,.0f} rows/s",
+                flush=True,
+            )
+            last_log = now
 
     # flush remaining
     if out_rows:
