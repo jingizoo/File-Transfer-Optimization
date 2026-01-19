@@ -1,8 +1,33 @@
-import os, time
+import os
+import sys
+import time
 from collections import defaultdict
 
-import oracledb
-import duckdb
+# Try oracledb first (newer), fall back to cx_Oracle (older, more stable)
+try:
+    import oracledb
+    ORACLE_LIB = "oracledb"
+except ImportError:
+    try:
+        import cx_Oracle as oracledb
+        ORACLE_LIB = "cx_Oracle"
+    except ImportError:
+        sys.stderr.write(
+            "ERROR: Neither oracledb nor cx_Oracle is installed.\n"
+            "Install one of them:\n"
+            "  Option 1 (recommended): pip3 install cx_Oracle\n"
+            "  Option 2: pip3 install oracledb\n"
+            "\n"
+            "Note: cx_Oracle is more stable and easier to install.\n"
+            "See ORACLE_INSTALL_FIX.md for troubleshooting.\n"
+        )
+        sys.exit(1)
+
+try:
+    import duckdb
+except ImportError:
+    sys.stderr.write("ERROR: duckdb not installed. Install with: pip3 install duckdb\n")
+    sys.exit(1)
 
 
 ORACLE_DSN = os.environ["ORACLE_DSN"]         
@@ -40,6 +65,7 @@ def main():
     cur = oconn.cursor()
     cur.arraysize = FETCH_BATCH
 
+    print(f"Using Oracle library: {ORACLE_LIB}")
     print("Executing:", SQL)
     cur.execute(SQL)
 
