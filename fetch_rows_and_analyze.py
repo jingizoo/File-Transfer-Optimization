@@ -29,41 +29,61 @@ except ImportError:
     sys.stderr.write("ERROR: duckdb not installed. Install with: pip3 install duckdb\n")
     sys.exit(1)
 
+# Optional: pandas for faster bulk inserts
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
 
 ORACLE_DSN = os.environ["ORACLE_DSN"]         
 ORACLE_USER = os.environ["ORACLE_USER"]
 ORACLE_PASSWORD = os.environ["ORACLE_PASSWORD"]
 
 TABLE = os.environ.get("ORACLE_TABLE", "prod.cust_prdt_prc_entr")
+
+# Optional: Oracle parallel degree (e.g. 4, 8). If set, we add a PARALLEL hint.
+ORACLE_PARALLEL_DEGREE = os.environ.get("ORACLE_PARALLEL_DEGREE")
 DUCKDB_PATH = os.environ.get("DUCKDB_PATH", "dups.duckdb")
 
 # how many rows to fetch from Oracle per round-trip
-FETCH_BATCH = int(os.environ.get("FETCH_BATCH", "50000"))
+FETCH_BATCH = int(os.environ.get("FETCH_BATCH", "100000"))  # Increased default
 
 # how many aggregated (unique-key) rows to insert to DuckDB at a time
-INSERT_BATCH = int(os.environ.get("INSERT_BATCH", "20000"))
+INSERT_BATCH = int(os.environ.get("INSERT_BATCH", "50000"))  # Increased default
 
-SQL = f"SELECT price_id, rqst_id, orgn_src_cde FROM {TABLE}"  # no WHERE, no ORDER BY, no DISTINCT
+# Build Oracle SQL, optionally with PARALLEL hint
+if ORACLE_PARALLEL_DEGREE:
+    # Simple hint: /*+ parallel(TABLE, DEGREE) */
+    _hint = f"/*+ parallel({TABLE}, {ORACLE_PARALLEL_DEGREE}) */ "
+else:
+    _hint = ""
+
+# NOTE: Oracle column is prc_id (not price_id)
+SQL = f"SELECT {_hint}prc_id, rqst_id, orgn_src_cde FROM {TABLE}"  # no WHERE, no ORDER BY, no DISTINCT
 
 def main():
-    # DuckDB setup
+    # DuckDB setup - optimized for speed
     ddb = duckdb.connect(DUCKDB_PATH)
     ddb.execute("PRAGMA threads = 8;")
-    ddb.execute("PRAGMA memory_limit = '8GB';")  # tune
+    ddb.execute("PRAGMA memory_limit = '8GB';")
+    ddb.execute("PRAGMA enable_progress_bar = false;")  # Disable progress bar overhead
+    # Fresh table each run so schema changes (e.g. BIGINT->VARCHAR) don't conflict
+    ddb.execute("DROP TABLE IF EXISTS delta_counts;")
     ddb.execute("""
-      CREATE TABLE IF NOT EXISTS delta_counts (
-        price_id BIGINT,
-        rqst_id BIGINT,
+      CREATE TABLE delta_counts (
+        prc_id VARCHAR,
+        rqst_id VARCHAR,
         orgn_src_cde VARCHAR,
         cnt BIGINT
       );
     """)
-    ddb.commit()
 
-    # Oracle setup
+    # Oracle setup - optimized for speed
     oconn = oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD, dsn=ORACLE_DSN)
     cur = oconn.cursor()
-    cur.arraysize = FETCH_BATCH
+    cur.arraysize = FETCH_BATCH  # Large fetch size reduces round-trips
 
     print(f"Using Oracle library: {ORACLE_LIB}")
     print("Executing:", SQL)
@@ -85,14 +105,26 @@ def main():
 
         # count keys in this chunk (keeps memory bounded)
         counts = defaultdict(int)
-        for price_id, rqst_id, orgn_src_cde in batch:
-            counts[(price_id, rqst_id, orgn_src_cde)] += 1
+        for prc_id, rqst_id, orgn_src_cde in batch:
+            # Convert to tuple key (faster than string conversion here)
+            key = (prc_id, rqst_id, orgn_src_cde)
+            counts[key] += 1
 
-        # push aggregated rows to DuckDB
+        # push aggregated rows to DuckDB - use bulk insert for speed
         for (k, c) in counts.items():
-            out_rows.append((k[0], k[1], k[2], c))
+            # Cast keys to string so Oracle types like TIMESTAMP/NUMBER map cleanly into DuckDB
+            out_rows.append((str(k[0]), str(k[1]), str(k[2]), c))
             if len(out_rows) >= INSERT_BATCH:
-                ddb.executemany("INSERT INTO delta_counts VALUES (?,?,?,?)", out_rows)
+                # Fastest: use pandas DataFrame + register() if available
+                if HAS_PANDAS:
+                    df = pd.DataFrame(out_rows, columns=['price_id', 'rqst_id', 'orgn_src_cde', 'cnt'])
+                    ddb.register("temp_batch", df)
+                    ddb.execute("INSERT INTO delta_counts SELECT * FROM temp_batch")
+                    ddb.unregister("temp_batch")
+                else:
+                    # Fallback: executemany (still fast with large batches)
+                    ddb.executemany("INSERT INTO delta_counts VALUES (?,?,?,?)", out_rows)
+                # Commit less frequently for better performance
                 ddb.commit()
                 out_rows.clear()
 
@@ -109,7 +141,13 @@ def main():
 
     # flush remaining
     if out_rows:
-        ddb.executemany("INSERT INTO delta_counts VALUES (?,?,?,?)", out_rows)
+        if HAS_PANDAS:
+            df = pd.DataFrame(out_rows, columns=['price_id', 'rqst_id', 'orgn_src_cde', 'cnt'])
+            ddb.register("temp_batch", df)
+            ddb.execute("INSERT INTO delta_counts SELECT * FROM temp_batch")
+            ddb.unregister("temp_batch")
+        else:
+            ddb.executemany("INSERT INTO delta_counts VALUES (?,?,?,?)", out_rows)
         ddb.commit()
         out_rows.clear()
 
