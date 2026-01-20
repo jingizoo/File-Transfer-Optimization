@@ -45,6 +45,7 @@ TABLE = os.environ.get("ORACLE_TABLE", "prod.cust_prdt_prc_entr")
 
 # Optional: Oracle parallel degree (e.g. 4, 8). If set, we add a PARALLEL hint.
 ORACLE_PARALLEL_DEGREE = os.environ.get("ORACLE_PARALLEL_DEGREE")
+ORACLE_PARALLEL_DEGREE = 8
 DUCKDB_PATH = os.environ.get("DUCKDB_PATH", "dups.duckdb")
 
 # how many rows to fetch from Oracle per round-trip

@@ -83,6 +83,18 @@ def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None) -> None:
         sys.stdout.flush()
     rc = p.wait()
     if rc != 0:
+        # Special-case rsync exit 23 to give a clearer explanation
+        base_cmd = os.path.basename(cmd[0]) if cmd else ""
+        if base_cmd == "rsync" and rc == 23:
+            eprint(
+                "[dir] rsync exit code 23: some files or attributes were NOT transferred.\n"
+                "      Common causes:\n"
+                "        - Permission denied reading some files on source\n"
+                "        - Permission denied setting owner/group/ACL/xattrs on destination\n"
+                "        - Files vanished during transfer (deleted/rotated while rsync was running)\n"
+                "        - Destination filesystem does not support some attributes (ACLs/xattrs)\n"
+                "      Scroll up to see the specific 'rsync:' ERROR/WARNING lines above."
+            )
         raise RuntimeError(f"Command failed (exit={rc}): {fmt_cmd(cmd)}")
 
 
