@@ -20,6 +20,8 @@ Optional:
 # instead of from __future__ import annotations (which requires Python 3.7+)
 
 import argparse
+import glob
+import signal
 import sys
 import os
 import queue
@@ -73,14 +75,57 @@ def run_checked(cmd: List[str], *, capture: bool = False, env: Optional[Dict[str
     return ""
 
 
-def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None) -> None:
-    """Run a command and stream combined stdout/stderr to our stdout."""
+def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> None:
+    """
+    Run a command and stream combined stdout/stderr to our stdout.
+    If timeout is set and the command hangs, it will be killed and raise RuntimeError.
+    Detects out-of-space errors (ENOSPC) and provides clear diagnostics.
+    """
     eprint("+", fmt_cmd(cmd))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     assert p.stdout is not None
-    for line in p.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
+    
+    # If timeout is set, use a thread to monitor and kill if needed
+    killed = threading.Event()
+    if timeout and timeout > 0:
+        def kill_if_timeout():
+            if not killed.wait(timeout):
+                eprint(f"\n[WARNING] Command exceeded timeout ({timeout}s), killing process...")
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        
+        timeout_thread = threading.Thread(target=kill_if_timeout, daemon=True)
+        timeout_thread.start()
+    
+    # Track output for out-of-space detection
+    output_lines: List[str] = []
+    enospc_detected = False
+    
+    try:
+        for line in p.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            output_lines.append(line)
+            # Detect out-of-space errors
+            line_lower = line.lower()
+            if any(phrase in line_lower for phrase in [
+                "no space left",
+                "no space left on device",
+                "enospc",
+                "disk full",
+                "filesystem is full",
+                "out of space",
+            ]):
+                enospc_detected = True
+    except BrokenPipeError:
+        # Process was killed
+        pass
+    
+    if timeout and timeout > 0:
+        killed.set()
+    
     rc = p.wait()
     if rc != 0:
         # Special-case rsync exit 23 to give a clearer explanation
@@ -95,7 +140,95 @@ def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None) -> None:
                 "        - Destination filesystem does not support some attributes (ACLs/xattrs)\n"
                 "      Scroll up to see the specific 'rsync:' ERROR/WARNING lines above."
             )
+        elif enospc_detected or (base_cmd == "rsync" and any("no space" in line.lower() or "enospc" in line.lower() for line in output_lines)):
+            eprint(
+                "\n[ERROR] DESTINATION OUT OF SPACE - This is why rsync hung!\n"
+                "        When a filesystem runs out of space, rsync can hang because:\n"
+                "        1. Write operations block indefinitely waiting for space\n"
+                "        2. The filesystem may not immediately return an error\n"
+                "        3. rsync buffers data and doesn't detect the error until buffer fills\n"
+                "\n"
+                "        Solutions:\n"
+                "        - Free up space on destination: df -h <destination_path>\n"
+                "        - Delete old files or increase filesystem size\n"
+                "        - Use --skip-space-check to disable pre-flight checks (not recommended)\n"
+                "        - Transfer smaller batches or use compression to reduce size\n"
+            )
+            raise RuntimeError(f"Destination out of space (ENOSPC): {fmt_cmd(cmd)}")
+        elif timeout and timeout > 0 and rc == -9:  # SIGKILL
+            raise RuntimeError(f"Command timed out after {timeout}s and was killed: {fmt_cmd(cmd)}")
         raise RuntimeError(f"Command failed (exit={rc}): {fmt_cmd(cmd)}")
+
+
+def run_rsync_with_retry(
+    cmd: List[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    timeout: Optional[int] = None,
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+    is_local: bool = False,
+    src: Optional[str] = None,
+    dest: Optional[str] = None,
+) -> None:
+    """
+    Run rsync with retry logic and timeout protection.
+    Includes diagnostic output to identify where rsync might be stuck.
+    """
+    base_cmd = os.path.basename(cmd[0]) if cmd else ""
+    if base_cmd != "rsync":
+        # Not rsync, just run normally
+        run_stream(cmd, env=env, timeout=timeout)
+        return
+    
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1:
+                delay = retry_delay * (2 ** (attempt - 2))  # Exponential backoff
+                eprint(f"[retry] Attempt {attempt}/{max_retries} after {delay:.1f}s delay...")
+                time.sleep(delay)
+            
+            # Add diagnostic: show what rsync is doing
+            eprint(f"[rsync] Starting transfer (attempt {attempt}/{max_retries})...")
+            eprint(f"[rsync] If this hangs, it's likely stuck on:")
+            eprint(f"        - Directory scanning/listing (large directories)")
+            eprint(f"        - Metadata operations (stat() calls on slow NAS)")
+            eprint(f"        - Network timeout (check NAS connectivity)")
+            eprint(f"        - File permissions (access denied)")
+            
+            run_stream(cmd, env=env, timeout=timeout)
+            return  # Success
+        except RuntimeError as e:
+            last_error = e
+            error_msg = str(e)
+            # Check if it's a timeout or hang
+            if "timed out" in error_msg.lower() or "killed" in error_msg.lower():
+                eprint(f"[retry] rsync timed out/hung on attempt {attempt}/{max_retries}")
+                eprint(f"[diagnostic] This usually means rsync was stuck on:")
+                eprint(f"            - Scanning directories (use --no-inc-recursive)")
+                eprint(f"            - Reading file metadata (NAS is slow to respond)")
+                eprint(f"            - Network connection (check NAS mount health)")
+            elif "exit=23" in error_msg or "exit code 23" in error_msg:
+                # Exit 23 is usually non-fatal (some files not transferred), but we'll retry once
+                if attempt < max_retries:
+                    eprint(f"[retry] rsync exit 23 on attempt {attempt}/{max_retries}, retrying...")
+                else:
+                    # Last attempt, let it through
+                    raise
+            else:
+                eprint(f"[retry] rsync failed on attempt {attempt}/{max_retries}: {error_msg}")
+    
+    # All retries exhausted
+    eprint(f"\n[ERROR] rsync failed after {max_retries} attempts.")
+    eprint(f"[diagnostic] Common root causes for rsync hangs on NAS mounts:")
+    eprint(f"  1. Deep directory recursion - rsync scans entire tree (fix: use --no-inc-recursive)")
+    eprint(f"  2. Slow metadata operations - stat() calls hang on slow NAS (fix: reduce --timeout)")
+    eprint(f"  3. Network timeouts - TCP connections hang without keepalive (fix: check SSH keepalive)")
+    eprint(f"  4. Large directory listings - reading dir contents hangs (fix: use --max-size filter)")
+    eprint(f"  5. File locking - files in use by other processes (fix: check lsof/fuser)")
+    eprint(f"  6. Permission issues - access denied causes silent hangs (check rsync output above)")
+    raise last_error
 
 
 TARGET_RE = re.compile(r"^(?:(?P<user>[^@]+)@)?(?P<host>[^:]+):(?P<path>.+)$")
@@ -185,6 +318,9 @@ def ssh_base_args(connect_timeout: int, cipher: Optional[str], control_path: Opt
         "-o", "Compression=no",
         "-o", "IPQoS=throughput",
         "-o", f"ConnectTimeout={connect_timeout}",
+        # SSH keepalive to prevent connection hangs on NAS mounts
+        "-o", "ServerAliveInterval=30",  # Send keepalive every 30 seconds
+        "-o", "ServerAliveCountMax=3",    # Disconnect after 3 failed keepalives (90s total)
     ]
     # Only specify cipher if one was successfully negotiated
     if cipher:
@@ -661,15 +797,49 @@ def build_rsync_cmd(
     rsync_compress: bool = False,
     rsync_compress_level: int = 1,
     extra_args: Optional[List[str]] = None,
+    contimeout: Optional[int] = None,
+    no_inc_recursive: bool = False,
+    skip_problematic: bool = True,
 ) -> List[str]:
+    """
+    Build rsync command with anti-hang options for NAS mounts.
+    
+    Root causes of rsync hangs on NAS:
+    1. Deep recursion - rsync scans entire directory tree (--no-inc-recursive helps)
+    2. Slow metadata - stat() calls hang on slow NAS (--timeout helps)
+    3. Connection hangs - TCP connections without keepalive (--contimeout helps)
+    4. Large dirs - reading directory contents hangs (--no-inc-recursive helps)
+    5. Problematic files - symlinks/devices can cause issues (--safe-links helps)
+    """
     cmd: List[str] = [
         "rsync",
         "-rtvh",
-        "--info=progress2",
+        "--info=progress2,name",  # Show both progress and file names (helps identify where it's stuck)
         "--partial",
         "--protect-args",
         f"--timeout={timeout}",
     ]
+    
+    # Connection timeout - prevents hanging on initial connection
+    if contimeout:
+        cmd.append(f"--contimeout={contimeout}")
+    elif timeout > 0:
+        # Default contimeout to same as timeout if not specified
+        cmd.append(f"--contimeout={timeout}")
+    
+    # Prevent deep recursion hangs - use non-incremental recursion for large directories
+    if no_inc_recursive:
+        cmd.append("--no-inc-recursive")
+        eprint("[rsync] Using --no-inc-recursive to prevent deep recursion hangs on NAS")
+    
+    # Skip problematic files that can cause hangs
+    if skip_problematic:
+        # --safe-links: ignore symlinks that point outside the tree (prevents following bad symlinks)
+        # --no-D: skip device files (can hang on some NAS)
+        # --no-specials: skip special files (fifos, sockets, etc.)
+        cmd.append("--safe-links")
+        # Note: --no-D and --no-specials are not standard, so we'll handle via filters if needed
+    
     if ssh_e:
         cmd.extend(["-e", ssh_e])
     if rsync_compress:
@@ -729,6 +899,8 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
         # Use rsync compression for remote transfers if enabled
         use_rsync_compress = args.rsync_compress if hasattr(args, 'rsync_compress') else False
         rsync_comp_level = args.rsync_compress_level if hasattr(args, 'rsync_compress_level') else 1
+        contimeout = getattr(args, 'rsync_contimeout', None) or getattr(args, 'rsync_timeout', None)
+        no_inc_recursive = getattr(args, 'rsync_no_inc_recursive', False)
         cmd = build_rsync_cmd(
             str(args.source),
             dest,
@@ -740,10 +912,21 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
             timeout=args.rsync_timeout,
             rsync_compress=use_rsync_compress,
             rsync_compress_level=rsync_comp_level,
+            contimeout=contimeout,
+            no_inc_recursive=no_inc_recursive,
         )
         if use_rsync_compress:
             eprint(f"[direct] Using rsync built-in compression (level {rsync_comp_level}) for on-the-fly compression")
-        run_stream(cmd)
+        rsync_timeout = getattr(args, 'rsync_operation_timeout', None) or getattr(args, 'rsync_timeout', None)
+        max_retries = getattr(args, 'rsync_max_retries', 3)
+        run_rsync_with_retry(
+            cmd,
+            timeout=rsync_timeout,
+            max_retries=max_retries,
+            is_local=is_local,
+            src=str(src),
+            dest=dest_file,
+        )
 
 
 def strategy_dir_rsync(
@@ -843,6 +1026,8 @@ def strategy_dir_rsync(
             eprint(f"[dir] Filtering: transferring {len(selected)} files with mtime AFTER {after_date_str}")
 
     # For directories we don't use append_only/whole_file/inplace/preallocate; rsync handles trees efficiently.
+    contimeout = getattr(args, 'rsync_contimeout', None) or getattr(args, 'rsync_timeout', None)
+    no_inc_recursive = getattr(args, 'rsync_no_inc_recursive', False)
     cmd = build_rsync_cmd(
         src_arg,
         dest_arg,
@@ -855,6 +1040,8 @@ def strategy_dir_rsync(
         rsync_compress=use_rsync_compress,
         rsync_compress_level=rsync_comp_level,
         extra_args=extra_rsync_args or None,
+        contimeout=contimeout,
+        no_inc_recursive=no_inc_recursive,
     )
 
     if is_local:
@@ -866,7 +1053,16 @@ def strategy_dir_rsync(
             eprint(f"[dir] Using rsync for remote directory transfer: {src_arg} -> {dest_root}/ on {user}@{host}")
 
     try:
-        run_stream(cmd)
+        rsync_timeout = getattr(args, 'rsync_operation_timeout', None) or getattr(args, 'rsync_timeout', None)
+        max_retries = getattr(args, 'rsync_max_retries', 3)
+        run_rsync_with_retry(
+            cmd,
+            timeout=rsync_timeout,
+            max_retries=max_retries,
+            is_local=is_local,
+            src=src_arg,
+            dest=dest_root,
+        )
     finally:
         # Cleanup temporary files-from list, if any
         if files_from_path:
@@ -1185,6 +1381,8 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
         eprint(f"[compress] Transfer completed in {transfer_elapsed:.1f}s ({human_bytes(transfer_speed)}/s)")
     else:
         dest = f"{user}@{host}:{comp_dest}"
+        contimeout = getattr(args, 'rsync_contimeout', None) or getattr(args, 'rsync_timeout', None)
+        no_inc_recursive = getattr(args, 'rsync_no_inc_recursive', False)
         cmd = build_rsync_cmd(
             str(comp_local),
             dest,
@@ -1194,8 +1392,19 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
             inplace=False,
             preallocate=args.preallocate,
             timeout=args.rsync_timeout,
+            contimeout=contimeout,
+            no_inc_recursive=no_inc_recursive,
         )
-        run_stream(cmd)
+        rsync_timeout = getattr(args, 'rsync_operation_timeout', None) or getattr(args, 'rsync_timeout', None)
+        max_retries = getattr(args, 'rsync_max_retries', 3)
+        run_rsync_with_retry(
+            cmd,
+            timeout=rsync_timeout,
+            max_retries=max_retries,
+            is_local=is_local,
+            src=str(comp_local),
+            dest=comp_dest,
+        )
         transfer_elapsed = time.time() - transfer_start
         transfer_speed = comp_size / transfer_elapsed if transfer_elapsed > 0 else 0
         eprint(f"[compress] Transfer completed in {transfer_elapsed:.1f}s ({human_bytes(transfer_speed)}/s)")
@@ -1419,6 +1628,8 @@ def rsync_many_parallel(
     rsync_timeout: int,
     rsync_compress: bool = False,
     rsync_compress_level: int = 1,
+    operation_timeout: Optional[int] = None,
+    max_retries: int = 1,
 ) -> None:
     if is_local:
         # For local transfers, use fast parallel copy (faster than rsync)
@@ -1498,7 +1709,13 @@ def rsync_many_parallel(
             f"--timeout={rsync_timeout}",
             "--whole-file",
             "--info=name0",  # Minimal output: only show file names, no progress
+            "--safe-links",  # Prevent following symlinks that point outside tree (anti-hang)
         ]
+        # Connection timeout to prevent hanging on initial connection
+        if operation_timeout:
+            cmd.append(f"--contimeout={operation_timeout}")
+        elif rsync_timeout > 0:
+            cmd.append(f"--contimeout={rsync_timeout}")
         # Add rsync compression if enabled (for uncompressed files only)
         if rsync_compress and not str(p).endswith(('.gz', '.zst', '.bz2', '.xz', '.zip')):
             # Only compress if file doesn't appear to be already compressed
@@ -1508,19 +1725,35 @@ def rsync_many_parallel(
             cmd.extend(["-e", ssh_e])
         cmd.extend([str(p), dest_dir_str])
         
-        try:
-            # Run without streaming to avoid blocking - capture output instead
-            # This allows true parallel execution
-            subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,  # Suppress output for parallel transfers
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-            return (p, True, None)
-        except subprocess.CalledProcessError as e:
-            error_msg = f"{e.stderr.decode('utf-8', errors='ignore') if isinstance(e.stderr, bytes) else e.stderr or 'unknown error'}"
-            return (p, False, error_msg)
+        # Retry logic for individual file transfers
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Run without streaming to avoid blocking - capture output instead
+                # This allows true parallel execution
+                subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL,  # Suppress output for parallel transfers
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=operation_timeout if operation_timeout and operation_timeout > 0 else None,
+                )
+                return (p, True, None)
+            except subprocess.TimeoutExpired:
+                last_error = f"rsync timed out after {operation_timeout}s"
+                if attempt < max_retries:
+                    time.sleep(1.0 * attempt)  # Brief delay before retry
+                    continue
+                return (p, False, last_error)
+            except subprocess.CalledProcessError as e:
+                error_msg = f"{e.stderr.decode('utf-8', errors='ignore') if isinstance(e.stderr, bytes) else e.stderr or 'unknown error'}"
+                last_error = error_msg
+                if attempt < max_retries:
+                    time.sleep(1.0 * attempt)  # Brief delay before retry
+                    continue
+                return (p, False, error_msg)
+        
+        return (p, False, last_error or "unknown error")
 
     # Run transfers in parallel with better progress reporting
     completed = 0
@@ -1565,6 +1798,108 @@ def rsync_many_parallel(
 
 def local_mkdir_p(directory: str) -> None:
     Path(directory).mkdir(parents=True, exist_ok=True)
+
+
+def get_local_available_space(path: str) -> Optional[int]:
+    """Get available space in bytes on local filesystem. Returns None if check fails."""
+    try:
+        stat = os.statvfs(path)
+        return stat.f_bavail * stat.f_frsize  # Available space in bytes
+    except (OSError, AttributeError):
+        # statvfs not available on Windows, or path doesn't exist
+        try:
+            # Try using shutil.disk_usage (Python 3.3+)
+            usage = shutil.disk_usage(path)
+            return usage.free
+        except (OSError, AttributeError):
+            return None
+
+
+def get_remote_available_space(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], path: str) -> Optional[int]:
+    """Get available space in bytes on remote filesystem. Returns None if check fails."""
+    try:
+        # Use df to get available space: df -B1 /path | tail -1 | awk '{print $4}'
+        path_q = shlex.quote(path)
+        cmd = ssh_base_args(connect_timeout, cipher, control_path) + [
+            f"{user}@{host}",
+            f"df -B1 {path_q} 2>/dev/null | tail -1 | awk '{{print $4}}' || echo 'ERROR'"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=connect_timeout + 5)
+        if result.returncode == 0 and result.stdout.strip() and result.stdout.strip() != "ERROR":
+            try:
+                return int(result.stdout.strip())
+            except ValueError:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def calculate_source_size(src: Path) -> int:
+    """Calculate total size of source (file or directory) in bytes."""
+    if src.is_file():
+        try:
+            return src.stat().st_size
+        except OSError:
+            return 0
+    elif src.is_dir():
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(src):
+                for name in files:
+                    try:
+                        p = Path(root) / name
+                        total += p.stat().st_size
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return total
+    return 0
+
+
+def check_destination_space(
+    src_size: int,
+    is_local: bool,
+    dest_path: str,
+    user: Optional[str] = None,
+    host: Optional[str] = None,
+    connect_timeout: int = 10,
+    cipher: Optional[str] = None,
+    control_path: Optional[str] = None,
+    safety_margin: float = 1.1,
+) -> Tuple[bool, Optional[int], Optional[str]]:
+    """
+    Check if destination has enough space for transfer.
+    Returns (has_space, available_bytes, error_message).
+    safety_margin: multiply required space by this factor (default 1.1 = 10% extra).
+    """
+    required = int(src_size * safety_margin)
+    
+    if is_local:
+        available = get_local_available_space(dest_path)
+        if available is None:
+            return (True, None, "Could not check available space (continuing anyway)")
+        if available < required:
+            return (
+                False,
+                available,
+                f"Destination out of space: need {human_bytes(required)}, have {human_bytes(available)} (short by {human_bytes(required - available)})"
+            )
+        return (True, available, None)
+    else:
+        if not user or not host:
+            return (True, None, "Could not check remote space (user/host not set)")
+        available = get_remote_available_space(user, host, connect_timeout, cipher, control_path, dest_path)
+        if available is None:
+            return (True, None, "Could not check remote available space (continuing anyway)")
+        if available < required:
+            return (
+                False,
+                available,
+                f"Remote destination out of space: need {human_bytes(required)}, have {human_bytes(available)} (short by {human_bytes(required - available)})"
+            )
+        return (True, available, None)
 
 
 def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, dest_dir: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
@@ -1647,7 +1982,14 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
     # Use rsync compression for chunked transfers if enabled (only for uncompressed files)
     use_rsync_compress = args.rsync_compress if hasattr(args, 'rsync_compress') and not args.compress_chunks else False
     rsync_comp_level = args.rsync_compress_level if hasattr(args, 'rsync_compress_level') else 1
-    rsync_many_parallel(parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout, use_rsync_compress, rsync_comp_level)
+    operation_timeout = getattr(args, 'rsync_operation_timeout', None) or getattr(args, 'rsync_timeout', None)
+    max_retries = getattr(args, 'rsync_max_retries', 1)  # Use 1 for parallel transfers (retry is per-file)
+    rsync_many_parallel(
+        parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout,
+        use_rsync_compress, rsync_comp_level,
+        operation_timeout=operation_timeout,
+        max_retries=max_retries,
+    )
 
     # Reassemble file on destination
     stage_q = shlex.quote(stage_dir)
@@ -2309,7 +2651,7 @@ def main() -> int:
         description="Highly-tuned Linux-to-Linux file transfer wrapper (rsync/ssh, optional zstd, optional chunk parallelism).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("source", type=Path, help="Source file path on this machine")
+    p.add_argument("source", type=str, help="Source file/directory path on this machine (supports wildcards: *, ?, [])")
     p.add_argument("target", help="Target: /abs/path (local) OR user@10.0.0.15:/abs/path OR 10.0.0.15:/abs/path (remote, absolute path required)")
     p.add_argument("--user", default=None, help="SSH user (if not provided in target)")
     p.add_argument("--nfs-server", default=None, help="NFS server hostname/IP for NFS-to-NFS streaming (enables SSH streaming to NFS server even for local-looking paths)")
@@ -2320,6 +2662,10 @@ def main() -> int:
     p.add_argument("--preallocate", action="store_true", help="Use rsync --preallocate when possible")
     p.add_argument("--connect-timeout", type=int, default=10, help="SSH connect timeout (seconds)")
     p.add_argument("--rsync-timeout", type=int, default=0, help="rsync I/O timeout (0 = disabled)")
+    p.add_argument("--rsync-operation-timeout", type=int, default=300, help="Maximum time (seconds) for a single rsync operation before killing it (prevents hangs on NAS mounts, default: 300)")
+    p.add_argument("--rsync-max-retries", type=int, default=3, help="Maximum number of retries for rsync operations that fail or timeout (default: 3)")
+    p.add_argument("--rsync-contimeout", type=int, default=None, help="rsync connection timeout (prevents hanging on initial connection to NAS, default: same as --rsync-timeout)")
+    p.add_argument("--rsync-no-inc-recursive", action="store_true", help="Use --no-inc-recursive to prevent deep recursion hangs on large NAS directories (recommended for NAS mounts)")
     p.add_argument("--workdir", default=None, help="Working directory for artifacts/parts (default: alongside source, or temp for chunked)")
     p.add_argument("--cleanup-workdir", action="store_true", help="If --workdir is used with chunked, remove temp subdir after success")
     p.add_argument("--compressor", choices=["zstd", "pigz", "gzip"], default="pigz", help="Compression algorithm (pigz=fast parallel gzip, zstd=better ratio, gzip=fallback)")
@@ -2354,6 +2700,7 @@ def main() -> int:
         help="Directory mode ONLY: only transfer files whose modification time is AFTER this date (YYYY-MM-DD).",
     )
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
+    p.add_argument("--skip-space-check", action="store_true", help="Skip pre-flight space check on destination (not recommended - can cause hangs if out of space)")
 
     args = p.parse_args()
 
@@ -2365,10 +2712,32 @@ def main() -> int:
         if args.compressor == "zstd" and args.compression_level == 6:
             args.compression_level = args.zstd_level
 
-    src = args.source.resolve()
+    # Expand wildcards in source path
+    source_str = str(args.source)
+    if '*' in source_str or '?' in source_str or '[' in source_str:
+        # Wildcard pattern detected - expand it
+        expanded = sorted(glob.glob(source_str))
+        if not expanded:
+            eprint(f"ERROR: No files/directories match pattern: {source_str}")
+            return 2
+        eprint(f"[wildcard] Expanded '{source_str}' to {len(expanded)} path(s):")
+        for p in expanded:
+            eprint(f"  - {p}")
+        # For now, we'll process the first match (can be extended to handle multiple)
+        # TODO: Support multiple sources in a single run
+        if len(expanded) > 1:
+            eprint(f"[wildcard] WARNING: Multiple matches found ({len(expanded)}), processing first match only.")
+            eprint(f"[wildcard] To transfer all matches, run the command separately for each or use directory mode.")
+        src = Path(expanded[0]).resolve()
+    else:
+        src = Path(args.source).resolve()
+    
     if not src.exists() or (not src.is_file() and not src.is_dir()):
         eprint(f"ERROR: source path not found or unsupported type (must be file or directory): {src}")
         return 2
+    
+    # Store resolved source in args for use by strategies
+    args.source = src
 
     if which("rsync") is None:
         eprint("ERROR: requires rsync installed.")
@@ -2394,6 +2763,39 @@ def main() -> int:
         cipher = pick_ssh_cipher(user, host, args.connect_timeout, control_path)
         ssh_e = ssh_cmd_str(args.connect_timeout, cipher, control_path)
         remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, dest_dir)
+
+    # Pre-flight space check (unless disabled)
+    if not getattr(args, 'skip_space_check', False):
+        eprint("[space-check] Calculating source size...")
+        src_size = calculate_source_size(src)
+        if src_size > 0:
+            eprint(f"[space-check] Source size: {human_bytes(src_size)}")
+            has_space, available, error_msg = check_destination_space(
+                src_size,
+                is_local,
+                dest_dir,
+                user=user,
+                host=host,
+                connect_timeout=args.connect_timeout,
+                cipher=cipher,
+                control_path=control_path,
+            )
+            if available is not None:
+                eprint(f"[space-check] Destination available space: {human_bytes(available)}")
+            if not has_space:
+                eprint(f"[space-check] ERROR: {error_msg}")
+                eprint(f"[space-check] Transfer will likely HANG when destination runs out of space.")
+                eprint(f"[space-check] Solutions:")
+                eprint(f"  - Free up space on destination")
+                eprint(f"  - Delete old files or increase filesystem size")
+                eprint(f"  - Use compression to reduce transfer size: --rsync-compress or --strategy compress")
+                eprint(f"  - Transfer in smaller batches")
+                eprint(f"  - Use --skip-space-check to proceed anyway (NOT RECOMMENDED)")
+                return 1
+        else:
+            eprint("[space-check] Could not calculate source size, skipping space check")
+    else:
+        eprint("[space-check] Skipping space check (--skip-space-check enabled)")
 
     strategy = args.strategy
     if strategy == "auto":
