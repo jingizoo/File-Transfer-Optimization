@@ -3002,30 +3002,92 @@ def main() -> int:
     # Expand wildcards in source path
     source_str = str(args.source)
     sources: List[Path] = []
-    if '*' in source_str or '?' in source_str or '[' in source_str:
+    
+    # Check if pattern contains wildcards (more robust check)
+    has_wildcard = '*' in source_str or '?' in source_str or '[' in source_str
+    
+    if has_wildcard:
         # Wildcard pattern detected - expand it
-        expanded = sorted(glob.glob(source_str))
+        eprint(f"[wildcard] Detected wildcard pattern: {source_str}")
+        
+        # Handle both absolute and relative paths correctly
+        if os.path.isabs(source_str):
+            # Absolute path - use as-is
+            pattern = source_str
+        else:
+            # Relative path - resolve to current working directory
+            pattern = os.path.abspath(source_str)
+        
+        # Try glob expansion
+        try:
+            expanded = sorted(glob.glob(pattern))
+        except Exception as e:
+            eprint(f"ERROR: Failed to expand wildcard pattern '{source_str}': {e}")
+            eprint(f"       Make sure to quote the pattern if using shell wildcards: '{source_str}'")
+            return 2
+        
+        if not expanded:
+            # Try alternative: split directory and filename
+            pattern_dir = os.path.dirname(pattern) or '.'
+            pattern_base = os.path.basename(pattern)
+            
+            # If directory part has wildcards, we already tried full path glob
+            if '*' in pattern_dir or '?' in pattern_dir or '[' in pattern_dir:
+                eprint(f"ERROR: No files/directories match pattern: {source_str}")
+                eprint(f"       Pattern: {pattern}")
+                eprint(f"       Tip: Make sure the pattern is quoted: '{source_str}'")
+                return 2
+            
+            # Try globbing in the directory
+            if not os.path.isabs(pattern_dir):
+                pattern_dir = os.path.abspath(pattern_dir)
+            
+            if os.path.isdir(pattern_dir):
+                full_pattern = os.path.join(pattern_dir, pattern_base)
+                try:
+                    expanded = sorted(glob.glob(full_pattern))
+                except Exception as e:
+                    eprint(f"ERROR: Failed to expand pattern in directory: {e}")
+                    return 2
+            else:
+                eprint(f"ERROR: Directory does not exist: {pattern_dir}")
+                return 2
+        
         if not expanded:
             eprint(f"ERROR: No files/directories match pattern: {source_str}")
+            eprint(f"       Searched pattern: {pattern}")
+            eprint(f"       Tip: Make sure to quote the pattern: '{source_str}'")
+            eprint(f"       Tip: Test pattern with: ls {source_str}")
             return 2
+        
         eprint(f"[wildcard] Expanded '{source_str}' to {len(expanded)} path(s):")
         for p in expanded:
             eprint(f"  - {p}")
-            src_path = Path(p).resolve()
-            if src_path.exists() and (src_path.is_file() or src_path.is_dir()):
-                sources.append(src_path)
-            else:
-                eprint(f"[wildcard] WARNING: Skipping {p} (does not exist or unsupported type)")
+            try:
+                src_path = Path(p).resolve()
+                if src_path.exists() and (src_path.is_file() or src_path.is_dir()):
+                    sources.append(src_path)
+                else:
+                    eprint(f"[wildcard] WARNING: Skipping {p} (does not exist or unsupported type)")
+            except (OSError, ValueError) as e:
+                eprint(f"[wildcard] WARNING: Skipping {p} (error: {e})")
         
         if not sources:
             eprint(f"ERROR: No valid files/directories found matching pattern: {source_str}")
+            eprint(f"       Found {len(expanded)} matches but none were valid files/directories")
+            eprint(f"       Tip: Check file permissions and that files actually exist")
             return 2
     else:
-        src = Path(args.source).resolve()
-        if not src.exists() or (not src.is_file() and not src.is_dir()):
-            eprint(f"ERROR: source path not found or unsupported type (must be file or directory): {src}")
+        # No wildcards - single file/directory
+        try:
+            src = Path(args.source).resolve()
+            if not src.exists() or (not src.is_file() and not src.is_dir()):
+                eprint(f"ERROR: source path not found or unsupported type (must be file or directory): {src}")
+                return 2
+            sources = [src]
+        except (OSError, ValueError) as e:
+            eprint(f"ERROR: Invalid source path '{args.source}': {e}")
             return 2
-        sources = [src]
     
     if which("rsync") is None:
         eprint("ERROR: requires rsync installed.")
