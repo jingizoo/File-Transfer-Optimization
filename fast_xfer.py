@@ -196,6 +196,7 @@ def run_rsync_with_retry(
             eprint(f"        - Metadata operations (stat() calls on slow NAS)")
             eprint(f"        - Network timeout (check NAS connectivity)")
             eprint(f"        - File permissions (access denied)")
+            eprint(f"        - Domain authentication (CIFS/domain mounts - slower)")
             
             run_stream(cmd, env=env, timeout=timeout)
             return  # Success
@@ -228,42 +229,112 @@ def run_rsync_with_retry(
     eprint(f"  4. Large directory listings - reading dir contents hangs (fix: use --max-size filter)")
     eprint(f"  5. File locking - files in use by other processes (fix: check lsof/fuser)")
     eprint(f"  6. Permission issues - access denied causes silent hangs (check rsync output above)")
+    eprint(f"  7. Domain/CIFS mounts - authentication can be slow (fix: use extended timeouts)")
+    eprint(f"     - Domain mounts require Kerberos/AD authentication which adds latency")
+    eprint(f"     - CIFS mounts may need longer timeouts for initial connection")
+    eprint(f"     - Check mount health: mount | grep -i cifs")
+    eprint(f"     - Verify domain credentials: klist (for Kerberos) or smbclient -L //server")
     raise last_error
 
 
 TARGET_RE = re.compile(r"^(?:(?P<user>[^@]+)@)?(?P<host>[^:]+):(?P<path>.+)$")
 
 
+def get_mount_info(path: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Detect mount information for a path.
+    Returns (mount_type, server, mount_point) or None if detection fails.
+    mount_type: 'nfs', 'cifs', 'smb', 'domain', or 'unknown'
+    """
+    try:
+        # Use findmnt to get mount info (more reliable than /proc/mounts)
+        # findmnt -n -o SOURCE,TARGET,FSTYPE <path>
+        result = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE,TARGET,FSTYPE", path],
+            capture_output=True,
+            text=True,
+            timeout=5,  # Increased timeout for domain mounts
+        )
+        if result.returncode == 0 and result.stdout:
+            parts = result.stdout.strip().split()
+            if len(parts) >= 3:
+                source = parts[0]
+                mount_point = parts[1]
+                fstype = parts[2].lower()
+                
+                # Determine mount type
+                mount_type = "unknown"
+                server = None
+                
+                if fstype in ("nfs", "nfs4"):
+                    mount_type = "nfs"
+                    if ":" in source:
+                        if "/" in source:
+                            server = source.split("/")[0]
+                        else:
+                            server = source.rstrip(":")
+                elif fstype in ("cifs", "smb3", "smbfs"):
+                    mount_type = "cifs"
+                    # CIFS source format: //server/share or //domain;user@server/share
+                    if source.startswith("//"):
+                        parts_source = source[2:].split("/")
+                        if len(parts_source) > 0:
+                            server_part = parts_source[0]
+                            # Check for domain;user@server format
+                            if ";" in server_part:
+                                server = server_part.split(";")[-1].split("@")[-1]
+                            elif "@" in server_part:
+                                server = server_part.split("@")[-1]
+                            else:
+                                server = server_part
+                elif "domain" in fstype or "ad" in fstype or "kerberos" in fstype:
+                    mount_type = "domain"
+                    # Try to extract server from source
+                    if "://" in source:
+                        server = source.split("://")[1].split("/")[0]
+                    elif ":" in source:
+                        server = source.split(":")[0]
+                
+                if mount_type != "unknown":
+                    return (mount_type, server or "unknown", mount_point)
+    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError) as e:
+        # Timeout or findmnt not available - try alternative method
+        pass
+    
+    # Fallback: try to detect from /proc/mounts
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    mount_point = parts[1]
+                    fstype = parts[2].lower()
+                    source = parts[0]
+                    
+                    # Check if path is under this mount point
+                    try:
+                        if os.path.commonpath([path, mount_point]) == mount_point:
+                            if fstype in ("cifs", "smb3", "smbfs"):
+                                return ("cifs", "unknown", mount_point)
+                            elif fstype in ("nfs", "nfs4"):
+                                return ("nfs", "unknown", mount_point)
+                    except (ValueError, OSError):
+                        continue
+    except (OSError, FileNotFoundError):
+        pass
+    
+    return None
+
+
 def get_nfs_info(path: str) -> Optional[Tuple[str, str]]:
     """
     Detect if a path is on an NFS mount and return (server, export_path).
     Returns None if not NFS or detection fails.
+    (Kept for backward compatibility)
     """
-    try:
-        # Use findmnt to get mount info (more reliable than /proc/mounts)
-        # findmnt -n -o SOURCE,TARGET <path> returns: server:/export /mount/point
-        result = subprocess.run(
-            ["findmnt", "-n", "-o", "SOURCE,TARGET", path],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if result.returncode == 0 and result.stdout:
-            parts = result.stdout.strip().split()
-            if len(parts) >= 2:
-                source = parts[0]
-                # Check if it's NFS (starts with server: or server:/)
-                if ":" in source and not source.startswith("/"):
-                    # Extract server and export path
-                    if "/" in source:
-                        server, export_path = source.split("/", 1)
-                        export_path = "/" + export_path
-                    else:
-                        server = source.rstrip(":")
-                        export_path = "/"
-                    return (server, export_path)
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
-        pass
+    mount_info = get_mount_info(path)
+    if mount_info and mount_info[0] == "nfs":
+        return (mount_info[1], mount_info[2])
     return None
 
 
@@ -2745,6 +2816,24 @@ def main() -> int:
 
     is_local, user, host, target_path = parse_target(args.target, args.user, nfs_server=getattr(args, 'nfs_server', None))
     dest_dir, dest_file = normalize_dest_path(target_path, src if src.is_file() else Path(src.name))
+
+    # Detect mount type for source (important for domain mounts)
+    mount_info = None
+    if is_local:
+        mount_info = get_mount_info(str(src))
+        if mount_info:
+            mount_type, mount_server, mount_point = mount_info
+            eprint(f"[mount] Source detected on {mount_type.upper()} mount: {mount_server} -> {mount_point}")
+            if mount_type in ("cifs", "domain"):
+                eprint(f"[mount] Domain/CIFS mount detected - using extended timeouts for authentication")
+                # Adjust timeouts for domain mounts (they're slower due to authentication)
+                if not hasattr(args, 'rsync_timeout') or args.rsync_timeout == 0:
+                    args.rsync_timeout = 120  # Default 120s for domain mounts
+                if not hasattr(args, 'rsync_operation_timeout') or args.rsync_operation_timeout == 300:
+                    args.rsync_operation_timeout = 600  # 10 minutes for domain mounts
+                if not hasattr(args, 'rsync_contimeout'):
+                    args.rsync_contimeout = 60  # 60s connection timeout for domain
+                eprint(f"[mount] Adjusted timeouts: rsync-timeout={args.rsync_timeout}s, operation-timeout={args.rsync_operation_timeout}s")
 
     # For local transfers, we don't need SSH
     if is_local:
