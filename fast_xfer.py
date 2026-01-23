@@ -2717,6 +2717,221 @@ def sha256sum_local_path(path: str) -> str:
     return h
 
 
+def process_single_source(
+    args: argparse.Namespace,
+    is_local: bool,
+    user: Optional[str],
+    host: Optional[str],
+    target_path: str,
+    dest_dir: str,
+    ssh_e: Optional[str],
+    control_path: Optional[str],
+    cipher: Optional[str],
+) -> int:
+    """
+    Process a single source file/directory transfer.
+    Returns 0 on success, non-zero on failure.
+    """
+    src = Path(args.source).resolve()
+    
+    if not src.exists() or (not src.is_file() and not src.is_dir()):
+        eprint(f"ERROR: source path not found or unsupported type (must be file or directory): {src}")
+        return 2
+
+    dest_file = normalize_dest_path(target_path, src if src.is_file() else Path(src.name))[1]
+
+    # Detect mount type for source (important for domain mounts)
+    mount_info = None
+    if is_local:
+        mount_info = get_mount_info(str(src))
+        if mount_info:
+            mount_type, mount_server, mount_point = mount_info
+            eprint(f"[mount] Source detected on {mount_type.upper()} mount: {mount_server} -> {mount_point}")
+            if mount_type in ("cifs", "domain"):
+                eprint(f"[mount] Domain/CIFS mount detected - using extended timeouts for authentication")
+                # Adjust timeouts for domain mounts (they're slower due to authentication)
+                if not hasattr(args, 'rsync_timeout') or args.rsync_timeout == 0:
+                    args.rsync_timeout = 120  # Default 120s for domain mounts
+                if not hasattr(args, 'rsync_operation_timeout') or args.rsync_operation_timeout == 300:
+                    args.rsync_operation_timeout = 600  # 10 minutes for domain mounts
+                if not hasattr(args, 'rsync_contimeout'):
+                    args.rsync_contimeout = 60  # 60s connection timeout for domain
+                eprint(f"[mount] Adjusted timeouts: rsync-timeout={args.rsync_timeout}s, operation-timeout={args.rsync_operation_timeout}s")
+
+    # Pre-flight space check (unless disabled)
+    if not getattr(args, 'skip_space_check', False):
+        eprint("[space-check] Calculating source size...")
+        src_size = calculate_source_size(src)
+        if src_size > 0:
+            eprint(f"[space-check] Source size: {human_bytes(src_size)}")
+            has_space, available, error_msg = check_destination_space(
+                src_size,
+                is_local,
+                dest_dir,
+                user=user,
+                host=host,
+                connect_timeout=args.connect_timeout,
+                cipher=cipher,
+                control_path=control_path,
+            )
+            if available is not None:
+                eprint(f"[space-check] Destination available space: {human_bytes(available)}")
+            if not has_space:
+                eprint(f"[space-check] ERROR: {error_msg}")
+                eprint(f"[space-check] Transfer will likely HANG when destination runs out of space.")
+                eprint(f"[space-check] Solutions:")
+                eprint(f"  - Free up space on destination")
+                eprint(f"  - Delete old files or increase filesystem size")
+                eprint(f"  - Use compression to reduce transfer size: --rsync-compress or --strategy compress")
+                eprint(f"  - Transfer in smaller batches")
+                eprint(f"  - Use --skip-space-check to proceed anyway (NOT RECOMMENDED)")
+                return 1
+        else:
+            eprint("[space-check] Could not calculate source size, skipping space check")
+    else:
+        eprint("[space-check] Skipping space check (--skip-space-check enabled)")
+
+    strategy = args.strategy
+    if strategy == "auto":
+        # Auto rule of thumb:
+        #   1) If both ends have zstd and the file looks compressible -> compress (fastest over constrained links)
+        #   2) Else -> direct rsync
+        # Chunked/parallel is powerful but operationally heavier, so it's opt-in via --strategy chunked.
+        if args.append_only:
+            strategy = "direct"
+        else:
+            # Check if compressor is available
+            compressor = args.compressor
+            comp_info = get_compressor_cmd(compressor)
+            
+            if args.skip_estimate:
+                # Skip estimation, use direct
+                eprint("[auto] Skipping compression estimation (--skip-estimate)")
+                strategy = "direct"
+            elif is_local:
+                # For local, check if compressor is available
+                if comp_info:
+                    eprint(f"[auto] Estimating compression ratio with {compressor}...")
+                    sample_bytes = args.auto_sample_mib * 1024**2
+                    est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes, args.estimate_timeout)
+                    if est:
+                        ratio, in_b, out_b = est
+                        eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
+                        if ratio <= args.auto_threshold:
+                            strategy = "compress"
+                        else:
+                            strategy = "direct"
+                    else:
+                        eprint("[auto] Compression estimation failed or timed out, using direct transfer")
+                        strategy = "direct"
+                else:
+                    strategy = "direct"
+            else:
+                assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+                if comp_info:
+                    # Check if remote has decompressor
+                    _, decomp_cmd, _ = comp_info
+                    if compressor == "zstd":
+                        remote_cmd_check = "zstd"
+                    elif compressor in ("pigz", "gzip"):
+                        remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+                    else:
+                        remote_cmd_check = decomp_cmd
+                    
+                    if remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                        eprint(f"[auto] Estimating compression ratio with {compressor}...")
+                        sample_bytes = args.auto_sample_mib * 1024**2
+                        est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes, args.estimate_timeout)
+                        if est:
+                            ratio, in_b, out_b = est
+                            eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
+                            if ratio <= args.auto_threshold:
+                                strategy = "compress"
+                            else:
+                                strategy = "direct"
+                        else:
+                            eprint("[auto] Compression estimation failed or timed out, using direct transfer")
+                            strategy = "direct"
+                    else:
+                        strategy = "direct"
+                else:
+                    strategy = "direct"
+
+    start = time.time()
+    if src.is_dir():
+        # Directory mode: always use rsync-based directory transfer, ignore other strategies.
+        if strategy not in ("direct", "auto"):
+            eprint(f"[dir] WARNING: Source is a directory; ignoring --strategy={strategy!r} and using rsync directory transfer")
+        if is_local:
+            eprint(f"=== Directory transfer (rsync) | src={src}/ -> {target_path} (local) ===")
+        else:
+            eprint(f"=== Directory transfer (rsync) | src={src}/ -> {user}@{host}:{target_path} ===")
+    else:
+        if is_local:
+            eprint(f"=== Strategy: {strategy} | src={src} -> {dest_file} (local) ===")
+        else:
+            eprint(f"=== Strategy: {strategy} | src={src} -> {user}@{host}:{dest_file} ===")
+
+    try:
+        if src.is_dir():
+            # Directory tree transfer
+            strategy_dir_rsync(args, is_local, user, host, target_path, ssh_e)
+            if args.verify_sha256:
+                eprint("[dir] NOTE: --verify-sha256 is not implemented for directory transfers; skipping integrity check")
+        else:
+            # Single-file transfer strategies
+            if strategy == "direct":
+                strategy_direct(args, is_local, user, host, dest_file, ssh_e)
+            elif strategy == "compress":
+                strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+            elif strategy == "stream":
+                strategy_stream_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
+            elif strategy == "chunked":
+                strategy_chunked(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
+            elif strategy == "turbo":
+                strategy_turbo(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
+            else:
+                raise RuntimeError(f"Unknown strategy: {strategy}")
+
+            if args.verify_sha256:
+                eprint("=== Verifying sha256 (this will read the full file on both ends) ===")
+                local_h = sha256sum_local(src)
+                if is_local:
+                    remote_h = sha256sum_local_path(dest_file)
+                else:
+                    remote_h = sha256sum_remote(user, host, args.connect_timeout, cipher, control_path, dest_file)
+                eprint(f"source sha256:  {local_h}")
+                eprint(f"dest sha256:    {remote_h}")
+                if local_h != remote_h:
+                    raise RuntimeError("sha256 mismatch: transfer may be corrupted")
+
+        elapsed = time.time() - start
+        eprint(f"=== Done in {elapsed:.1f}s ===")
+        
+        # Remove source if --remove-source is set and transfer succeeded
+        if getattr(args, 'remove_source', False):
+            try:
+                if src.is_file():
+                    eprint(f"[move] Removing source file: {src}")
+                    src.unlink()
+                    eprint(f"[move] Source file removed successfully")
+                elif src.is_dir():
+                    eprint(f"[move] Removing source directory: {src}")
+                    import shutil
+                    shutil.rmtree(src)
+                    eprint(f"[move] Source directory removed successfully")
+            except Exception as e:
+                eprint(f"[move] WARNING: Failed to remove source {src}: {e}")
+                eprint(f"[move] Source file preserved - you may need to remove it manually")
+        
+        return 0
+    except Exception as ex:
+        eprint(f"ERROR: {ex}")
+        if getattr(args, 'remove_source', False):
+            eprint(f"[move] Transfer failed, source file preserved: {src}")
+        return 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Highly-tuned Linux-to-Linux file transfer wrapper (rsync/ssh, optional zstd, optional chunk parallelism).",
@@ -2772,6 +2987,7 @@ def main() -> int:
     )
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
     p.add_argument("--skip-space-check", action="store_true", help="Skip pre-flight space check on destination (not recommended - can cause hangs if out of space)")
+    p.add_argument("--remove-source", action="store_true", help="Delete source file(s) after successful transfer (move operation - use with caution)")
 
     args = p.parse_args()
 
@@ -2785,6 +3001,7 @@ def main() -> int:
 
     # Expand wildcards in source path
     source_str = str(args.source)
+    sources: List[Path] = []
     if '*' in source_str or '?' in source_str or '[' in source_str:
         # Wildcard pattern detected - expand it
         expanded = sorted(glob.glob(source_str))
@@ -2794,28 +3011,84 @@ def main() -> int:
         eprint(f"[wildcard] Expanded '{source_str}' to {len(expanded)} path(s):")
         for p in expanded:
             eprint(f"  - {p}")
-        # For now, we'll process the first match (can be extended to handle multiple)
-        # TODO: Support multiple sources in a single run
-        if len(expanded) > 1:
-            eprint(f"[wildcard] WARNING: Multiple matches found ({len(expanded)}), processing first match only.")
-            eprint(f"[wildcard] To transfer all matches, run the command separately for each or use directory mode.")
-        src = Path(expanded[0]).resolve()
+            src_path = Path(p).resolve()
+            if src_path.exists() and (src_path.is_file() or src_path.is_dir()):
+                sources.append(src_path)
+            else:
+                eprint(f"[wildcard] WARNING: Skipping {p} (does not exist or unsupported type)")
+        
+        if not sources:
+            eprint(f"ERROR: No valid files/directories found matching pattern: {source_str}")
+            return 2
     else:
         src = Path(args.source).resolve()
+        if not src.exists() or (not src.is_file() and not src.is_dir()):
+            eprint(f"ERROR: source path not found or unsupported type (must be file or directory): {src}")
+            return 2
+        sources = [src]
     
-    if not src.exists() or (not src.is_file() and not src.is_dir()):
-        eprint(f"ERROR: source path not found or unsupported type (must be file or directory): {src}")
-        return 2
-    
-    # Store resolved source in args for use by strategies
-    args.source = src
-
     if which("rsync") is None:
         eprint("ERROR: requires rsync installed.")
         return 2
 
     is_local, user, host, target_path = parse_target(args.target, args.user, nfs_server=getattr(args, 'nfs_server', None))
-    dest_dir, dest_file = normalize_dest_path(target_path, src if src.is_file() else Path(src.name))
+    dest_dir, _ = normalize_dest_path(target_path, Path("dummy"))  # Get dest_dir, dest_file will be calculated per source
+
+    # For local transfers, we don't need SSH
+    if is_local:
+        eprint("[local] Detected local path - using direct file operations")
+        local_mkdir_p(dest_dir)
+        ssh_e = None
+        control_path = None
+        cipher = None
+    else:
+        if which("ssh") is None:
+            eprint("ERROR: requires ssh installed for remote transfers.")
+            return 2
+        # Use user-specified temp dir or system default (respects TMPDIR env var)
+        temp_base = args.temp_dir if hasattr(args, 'temp_dir') and args.temp_dir else tempfile.gettempdir()
+        control_path = os.path.join(temp_base, f"sshcm-{os.getpid()}-%r@%h:%p")
+        cipher = pick_ssh_cipher(user, host, args.connect_timeout, control_path)
+        ssh_e = ssh_cmd_str(args.connect_timeout, cipher, control_path)
+        remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, dest_dir)
+
+    # Process multiple sources if wildcard matched multiple files
+    if len(sources) > 1:
+        eprint(f"[wildcard] Processing {len(sources)} files/directories...")
+        failed = []
+        for idx, src in enumerate(sources, 1):
+            eprint(f"\n{'='*60}")
+            eprint(f"[{idx}/{len(sources)}] Processing: {src}")
+            eprint(f"{'='*60}")
+            try:
+                # Create a copy of args for this source
+                src_args = argparse.Namespace(**vars(args))
+                src_args.source = src
+                # Process this source
+                result = process_single_source(src_args, is_local, user, host, target_path, dest_dir, ssh_e, control_path, cipher)
+                if result != 0:
+                    failed.append((src, result))
+                    if getattr(args, 'remove_source', False):
+                        eprint(f"[move] Transfer failed for {src}, source file preserved")
+            except Exception as e:
+                eprint(f"ERROR processing {src}: {e}")
+                failed.append((src, 1))
+                if getattr(args, 'remove_source', False):
+                    eprint(f"[move] Transfer failed for {src}, source file preserved")
+        
+        # Summary
+        eprint(f"\n{'='*60}")
+        eprint(f"[wildcard] Summary: {len(sources) - len(failed)}/{len(sources)} succeeded")
+        if failed:
+            eprint(f"[wildcard] Failed transfers:")
+            for src, code in failed:
+                eprint(f"  - {src} (exit code: {code})")
+            return 1
+        return 0
+    else:
+        # Single source - process normally
+        args.source = sources[0]
+        return process_single_source(args, is_local, user, host, target_path, dest_dir, ssh_e, control_path, cipher)
 
     # Detect mount type for source (important for domain mounts)
     mount_info = None

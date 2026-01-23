@@ -1,155 +1,259 @@
-# Chunk Size Optimization Guide
+# How to Specify Chunk Size
 
-## Overview
+## Quick Answer
 
-The optimal chunk size for `--strategy chunked` depends on several factors. This guide helps you choose the best chunk size for your use case.
+Use the `--chunk-size` flag with the `chunked` or `turbo` strategy:
 
-## Factors to Consider
-
-### 1. Network Bandwidth
-
-**High-speed links (10Gbps, 25Gbps, 40Gbps+):**
-- **Recommended**: 10G - 50G per chunk
-- **Rationale**: Larger chunks reduce overhead and better utilize bandwidth
-- **Example**: `--chunk-size 20G --parallel 4` for 10G link
-
-**Medium-speed links (1Gbps - 5Gbps):**
-- **Recommended**: 2G - 10G per chunk
-- **Rationale**: Balance between overhead and transfer efficiency
-- **Example**: `--chunk-size 5G --parallel 2`
-
-**Slow links (< 1Gbps):**
-- **Recommended**: 500M - 2G per chunk
-- **Rationale**: Smaller chunks allow better progress tracking and resume capability
-- **Example**: `--chunk-size 1G --parallel 2`
-
-### 2. File Size
-
-**Very large files (500GB+):**
-- Use larger chunks (20G - 50G) to minimize overhead
-- More parallel workers (4-8) to saturate bandwidth
-
-**Large files (50GB - 500GB):**
-- Medium chunks (10G - 20G)
-- Moderate parallelism (2-4 workers)
-
-**Medium files (5GB - 50GB):**
-- Smaller chunks (2G - 10G)
-- Fewer workers (1-2) may be sufficient
-
-**Small files (< 5GB):**
-- Consider using `--strategy direct` instead of chunked
-- If chunked, use 500M - 2G chunks
-
-### 3. Available Memory
-
-**High memory systems (32GB+):**
-- Can handle larger chunks (20G - 50G)
-- More parallel workers possible
-
-**Medium memory (8GB - 32GB):**
-- Moderate chunks (5G - 20G)
-- Limit parallel workers to 2-4
-
-**Low memory (< 8GB):**
-- Smaller chunks (1G - 5G)
-- Fewer parallel workers (1-2)
-
-### 4. Disk I/O Performance
-
-**Fast storage (NVMe SSD, high-end SAN):**
-- Larger chunks (20G - 50G) are fine
-- Can handle more parallel I/O
-
-**Standard storage (SATA SSD, HDD):**
-- Medium chunks (5G - 20G)
-- Moderate parallelism to avoid I/O contention
-
-**Slow storage (network storage, slow HDD):**
-- Smaller chunks (2G - 10G)
-- Fewer parallel workers
-
-## Quick Reference Table
-
-| Network Speed | File Size | Recommended Chunk Size | Parallel Workers |
-|--------------|-----------|----------------------|------------------|
-| 10Gbps+      | 500GB+    | 20G - 50G            | 4 - 8            |
-| 10Gbps+      | 50-500GB  | 10G - 20G            | 2 - 4            |
-| 1-5Gbps      | 100GB+    | 5G - 10G             | 2 - 4            |
-| 1-5Gbps      | 10-100GB  | 2G - 5G              | 1 - 2            |
-| < 1Gbps      | Any       | 500M - 2G            | 1 - 2            |
-
-## Calculation Formula
-
-**Rough guideline:**
-```
-Optimal chunk size ≈ (Network bandwidth × 10 seconds) / Parallel workers
-```
-
-**Example for 10Gbps link with 4 workers:**
-- 10Gbps = 1.25GB/s
-- 1.25GB/s × 10s = 12.5GB
-- 12.5GB / 4 workers ≈ 3GB per chunk
-- **Recommended**: 5G - 10G (accounting for overhead)
-
-## Best Practices
-
-1. **Start conservative**: Begin with smaller chunks (5G) and increase if needed
-2. **Match parallelism**: More workers = can use larger chunks
-3. **Consider compression**: With `--compress-chunks`, chunks may be smaller after compression
-4. **Monitor performance**: Watch transfer speeds and adjust accordingly
-5. **Avoid too many chunks**: Too many small chunks increases overhead
-
-## Examples
-
-### High-speed link, huge file
 ```bash
-fast-xfer 1TB_file.dat user@host:/dest/ \
+./fast_xfer.py /source/file.bin /destination/ --strategy chunked --chunk-size 10G
+```
+
+## Chunk Size Format
+
+The chunk size accepts human-readable size formats:
+
+### Supported Units
+
+- **Bytes**: `1073741824` (no unit = bytes)
+- **K or KB**: Kilobytes (1024 bytes)
+- **M or MB**: Megabytes (1024² bytes)
+- **G or GB**: Gigabytes (1024³ bytes)
+- **T or TB**: Terabytes (1024⁴ bytes)
+
+### Examples
+
+```bash
+# 500 Megabytes
+--chunk-size 500M
+--chunk-size 500MB
+
+# 10 Gigabytes (default)
+--chunk-size 10G
+--chunk-size 10GB
+
+# 20 Gigabytes
+--chunk-size 20G
+--chunk-size 20GB
+
+# 1 Terabyte
+--chunk-size 1T
+--chunk-size 1TB
+
+# 4 Gigabytes
+--chunk-size 4G
+```
+
+## Complete Examples
+
+### Example 1: Small Chunks (500MB)
+```bash
+./fast_xfer.py /mnt/source/largefile.bin /backup/ \
   --strategy chunked \
-  --chunk-size 25G \
-  --parallel 6 \
+  --chunk-size 500M \
+  --parallel 1
+```
+**Use case**: Slow network, want faster progress updates
+
+### Example 2: Medium Chunks (10GB) - Default
+```bash
+./fast_xfer.py /mnt/source/largefile.bin /backup/ \
+  --strategy chunked \
+  --chunk-size 10G
+```
+**Use case**: 10Gbps network, balanced performance
+
+### Example 3: Large Chunks (50GB)
+```bash
+./fast_xfer.py /mnt/source/hugefile.bin /backup/ \
+  --strategy chunked \
+  --chunk-size 50G \
+  --parallel 4
+```
+**Use case**: 25Gbps+ network, maximum throughput
+
+### Example 4: Very Small Chunks (100MB)
+```bash
+./fast_xfer.py /mnt/source/file.bin /backup/ \
+  --strategy chunked \
+  --chunk-size 100M
+```
+**Use case**: Very slow/unreliable network, frequent progress
+
+### Example 5: With Compression
+```bash
+./fast_xfer.py /mnt/source/file.bin /backup/ \
+  --strategy chunked \
+  --chunk-size 5G \
   --compress-chunks
 ```
+**Use case**: Compress each chunk before transfer
 
-### Medium-speed link, large file
+## Recommended Chunk Sizes by Network Speed
+
+| Network Speed | Recommended Chunk Size | Example |
+|--------------|------------------------|---------|
+| < 1 Gbps | 500M - 2G | `--chunk-size 1G` |
+| 1-10 Gbps | 5G - 20G | `--chunk-size 10G` (default) |
+| 10-25 Gbps | 10G - 50G | `--chunk-size 20G` |
+| 25+ Gbps | 20G - 100G | `--chunk-size 50G` |
+
+## Recommended Chunk Sizes by Use Case
+
+### For Domain/CIFS Mounts (Slow)
 ```bash
-fast-xfer 200GB_file.dat user@host:/dest/ \
-  --strategy chunked \
-  --chunk-size 10G \
-  --parallel 3
+--chunk-size 1G
+```
+- Smaller chunks = faster progress updates
+- Less likely to timeout
+- Better for slow metadata operations
+
+### For Fast Local Network
+```bash
+--chunk-size 20G
+```
+- Default size works well
+- Good balance of overhead vs throughput
+
+### For Very Large Files (100GB+)
+```bash
+--chunk-size 50G
+```
+- Fewer chunks = less overhead
+- Better for parallel transfers
+
+### For Unreliable Networks
+```bash
+--chunk-size 500M
+```
+- Smaller chunks = faster recovery on failure
+- Less data to retransmit if chunk fails
+
+## How Chunking Works
+
+1. **Split**: File is split into chunks of specified size
+2. **Transfer**: Each chunk is transferred (optionally in parallel)
+3. **Reassemble**: Chunks are reassembled on destination
+
+### Example Flow
+
+```
+Original file: 100GB
+Chunk size: 10G
+
+Result:
+- part.0000 (10GB)
+- part.0001 (10GB)
+- part.0002 (10GB)
+...
+- part.0009 (10GB)
+
+Total: 10 chunks
 ```
 
-### Slow link, any file
+## Chunk Size Considerations
+
+### Smaller Chunks (Pros)
+- ✅ Faster progress updates
+- ✅ Better for slow/unreliable networks
+- ✅ Less data to retransmit on failure
+- ✅ Lower memory usage
+
+### Smaller Chunks (Cons)
+- ❌ More overhead (more chunks to manage)
+- ❌ More network round-trips
+- ❌ Slower for fast networks
+
+### Larger Chunks (Pros)
+- ✅ Less overhead
+- ✅ Better for fast networks
+- ✅ Fewer files to manage
+- ✅ Better parallelization
+
+### Larger Chunks (Cons)
+- ❌ Slower progress updates
+- ❌ More data to retransmit on failure
+- ❌ Higher memory usage
+- ❌ Longer timeout risk
+
+## When to Use Chunked Strategy
+
+Use `--strategy chunked` when:
+- ✅ Transferring very large files (50GB+)
+- ✅ Want to parallelize transfer
+- ✅ Network is fast enough to benefit
+- ✅ Want resume capability per chunk
+
+**Don't use chunked when:**
+- ❌ Small files (< 10GB)
+- ❌ Very slow network (< 100 Mbps)
+- ❌ Domain mounts (use `direct` instead)
+
+## Complete Command Examples
+
+### Domain Mount with Small Chunks
 ```bash
-fast-xfer file.dat user@host:/dest/ \
+./fast_xfer.py /mnt/cust-domain/largefile.bin /backup/ \
   --strategy chunked \
   --chunk-size 1G \
+  --parallel 1 \
+  --rsync-no-inc-recursive
+```
+
+### Fast Network with Large Chunks
+```bash
+./fast_xfer.py /mnt/source/hugefile.bin /backup/ \
+  --strategy chunked \
+  --chunk-size 50G \
+  --parallel 4
+```
+
+### Compressed Chunks
+```bash
+./fast_xfer.py /mnt/source/file.bin /backup/ \
+  --strategy chunked \
+  --chunk-size 5G \
+  --compress-chunks \
   --parallel 2
 ```
 
+## Default Behavior
+
+If you don't specify `--chunk-size`:
+- **Default**: `20G` (20 Gigabytes)
+- Works well for most 10Gbps networks
+- Good balance of performance and overhead
+
 ## Troubleshooting
 
-**If transfers are slow:**
-- Try increasing chunk size
-- Increase parallel workers
-- Check if compression is helping or hurting
+### Error: "Invalid chunk_size"
+- Check format: use `M`, `G`, `T` suffixes
+- Examples: `500M`, `10G`, `1T`
+- Don't use spaces: `10 G` ❌, `10G` ✅
 
-**If you see memory issues:**
-- Reduce chunk size
-- Reduce parallel workers
-- Don't use compression
+### Chunks Too Small
+- Symptoms: Very slow, too many chunks
+- Fix: Increase chunk size: `--chunk-size 10G`
 
-**If network isn't saturated:**
-- Increase parallel workers
-- Increase chunk size
-- Check network conditions
+### Chunks Too Large
+- Symptoms: Timeouts, hangs
+- Fix: Decrease chunk size: `--chunk-size 1G`
 
-## Auto-Detection (Future Enhancement)
+### Out of Memory
+- Symptoms: Process killed, OOM errors
+- Fix: Decrease chunk size: `--chunk-size 5G`
 
-The tool may in the future auto-detect optimal chunk size based on:
-- File size
-- Available memory
-- Network speed (if detectable)
-- Disk I/O capabilities
+## Summary
 
-For now, use the guidelines above and experiment to find what works best for your environment.
+**Basic usage:**
+```bash
+./fast_xfer.py /source/file /destination/ \
+  --strategy chunked \
+  --chunk-size 10G
+```
+
+**Common sizes:**
+- Small: `--chunk-size 1G`
+- Medium: `--chunk-size 10G` (default)
+- Large: `--chunk-size 50G`
+
+**Format:** Use `M`, `G`, or `T` suffix (e.g., `500M`, `10G`, `1T`)
