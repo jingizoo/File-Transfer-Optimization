@@ -2741,8 +2741,12 @@ def process_single_source(
     dest_file = normalize_dest_path(target_path, src if src.is_file() else Path(src.name))[1]
 
     # Detect mount type for source (important for domain mounts)
+    # Skip if already detected for wildcard processing (optimization)
     mount_info = None
-    if is_local:
+    if hasattr(args, '_mount_info') and args._mount_info:
+        # Mount info already detected for wildcard batch - skip re-detection
+        mount_info = args._mount_info
+    elif is_local:
         mount_info = get_mount_info(str(src))
         if mount_info:
             mount_type, mount_server, mount_point = mount_info
@@ -3117,30 +3121,122 @@ def main() -> int:
     # Process multiple sources if wildcard matched multiple files
     if len(sources) > 1:
         eprint(f"[wildcard] Processing {len(sources)} files/directories...")
+        eprint(f"[wildcard] NOTE: Files are processed SEQUENTIALLY (one at a time)")
+        eprint(f"[wildcard]       Total time = sum of individual file times")
+        eprint(f"[wildcard]       Example: 5 files × 100s each = ~500s total")
+        
+        # Optimize: Do common setup once for all files
+        # 1. Detect mount type once (if all files are on same mount)
+        mount_info = None
+        mount_type_detected = False
+        if is_local and sources:
+            try:
+                first_mount = get_mount_info(str(sources[0]))
+                if first_mount:
+                    mount_type, mount_server, mount_point = first_mount
+                    # Check if all files are on same mount (optimization)
+                    all_same_mount = True
+                    for src in sources[1:3]:  # Check first few files
+                        other_mount = get_mount_info(str(src))
+                        if other_mount != first_mount:
+                            all_same_mount = False
+                            break
+                    
+                    if all_same_mount:
+                        mount_info = first_mount
+                        mount_type_detected = True
+                        eprint(f"[wildcard] All files on {mount_type.upper()} mount: {mount_server} -> {mount_point}")
+                        if mount_type in ("cifs", "domain"):
+                            eprint(f"[wildcard] Domain/CIFS mount detected - using extended timeouts for all files")
+                            if not hasattr(args, 'rsync_timeout') or args.rsync_timeout == 0:
+                                args.rsync_timeout = 120
+                            if not hasattr(args, 'rsync_operation_timeout') or args.rsync_operation_timeout == 300:
+                                args.rsync_operation_timeout = 600
+                            if not hasattr(args, 'rsync_contimeout'):
+                                args.rsync_contimeout = 60
+                            eprint(f"[wildcard] Adjusted timeouts: rsync-timeout={args.rsync_timeout}s, operation-timeout={args.rsync_operation_timeout}s")
+            except Exception:
+                pass  # Fall back to per-file detection
+        
+        # 2. Calculate total size once for space check (if enabled)
+        total_size = 0
+        if not getattr(args, 'skip_space_check', False):
+            eprint(f"[wildcard] Calculating total size of {len(sources)} files...")
+            for src in sources:
+                try:
+                    if src.is_file():
+                        total_size += src.stat().st_size
+                    elif src.is_dir():
+                        total_size += calculate_source_size(src)
+                except Exception:
+                    pass
+            if total_size > 0:
+                eprint(f"[wildcard] Total size: {human_bytes(total_size)}")
+                has_space, available, error_msg = check_destination_space(
+                    total_size,
+                    is_local,
+                    dest_dir,
+                    user=user,
+                    host=host,
+                    connect_timeout=args.connect_timeout,
+                    cipher=cipher,
+                    control_path=control_path,
+                )
+                if available is not None:
+                    eprint(f"[wildcard] Destination available space: {human_bytes(available)}")
+                if not has_space:
+                    eprint(f"[wildcard] ERROR: {error_msg}")
+                    eprint(f"[wildcard] Transfer will likely HANG when destination runs out of space.")
+                    return 1
+            # Skip per-file space checks
+            args.skip_space_check = True
+        
+        # 3. Pre-determine strategy if not auto (avoid per-file strategy selection)
+        strategy_fixed = args.strategy != "auto"
+        
         failed = []
+        total_start = time.time()
         for idx, src in enumerate(sources, 1):
             eprint(f"\n{'='*60}")
             eprint(f"[{idx}/{len(sources)}] Processing: {src}")
             eprint(f"{'='*60}")
+            file_start = time.time()
             try:
                 # Create a copy of args for this source
                 src_args = argparse.Namespace(**vars(args))
                 src_args.source = src
+                # Skip mount detection if already done
+                if mount_type_detected:
+                    # Pass mount info to avoid re-detection
+                    src_args._mount_info = mount_info
                 # Process this source
                 result = process_single_source(src_args, is_local, user, host, target_path, dest_dir, ssh_e, control_path, cipher)
+                file_elapsed = time.time() - file_start
                 if result != 0:
                     failed.append((src, result))
+                    eprint(f"[{idx}/{len(sources)}] FAILED in {file_elapsed:.1f}s")
                     if getattr(args, 'remove_source', False):
                         eprint(f"[move] Transfer failed for {src}, source file preserved")
+                else:
+                    eprint(f"[{idx}/{len(sources)}] SUCCESS in {file_elapsed:.1f}s (per-file time)")
             except Exception as e:
+                file_elapsed = time.time() - file_start
                 eprint(f"ERROR processing {src}: {e}")
+                eprint(f"[{idx}/{len(sources)}] FAILED in {file_elapsed:.1f}s")
                 failed.append((src, 1))
                 if getattr(args, 'remove_source', False):
                     eprint(f"[move] Transfer failed for {src}, source file preserved")
         
-        # Summary
+        # Summary with total time
+        total_elapsed = time.time() - total_start
         eprint(f"\n{'='*60}")
-        eprint(f"[wildcard] Summary: {len(sources) - len(failed)}/{len(sources)} succeeded")
+        eprint(f"[wildcard] SUMMARY")
+        eprint(f"{'='*60}")
+        eprint(f"[wildcard] Files processed: {len(sources) - len(failed)}/{len(sources)} succeeded")
+        eprint(f"[wildcard] Total time: {total_elapsed:.1f}s (sequential processing)")
+        if len(sources) > 1:
+            avg_time = total_elapsed / len(sources)
+            eprint(f"[wildcard] Average time per file: {avg_time:.1f}s")
         if failed:
             eprint(f"[wildcard] Failed transfers:")
             for src, code in failed:
