@@ -128,8 +128,33 @@ def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None, timeout:
     
     rc = p.wait()
     if rc != 0:
-        # Special-case rsync exit 23 to give a clearer explanation
         base_cmd = os.path.basename(cmd[0]) if cmd else ""
+
+        # Treat rsync exit 24 (vanished files) as non-fatal, but summarize all affected files
+        if base_cmd == "rsync" and rc == 24:
+            vanished_lines: List[str] = []
+
+            for raw in output_lines:
+                line = raw.strip()
+                lower = line.lower()
+                # Typical rsync messages include:
+                #   "rsync warning: some files vanished before they could be transferred"
+                # and file-specific lines mentioning "vanished"
+                if "vanished before they could be transferred" in lower or "vanished" in lower:
+                    vanished_lines.append(line)
+
+            eprint("\n[rsync] Exit code 24: some files vanished before they could be transferred.")
+            if vanished_lines:
+                eprint(f"[rsync] Total vanished/errored lines: {len(vanished_lines)}")
+                for line in vanished_lines:
+                    eprint(f"[vanished] {line}")
+            else:
+                eprint("[rsync] Exit code 24, but no 'vanished' lines were detected in rsync output; review logs above.")
+
+            # IMPORTANT: do NOT raise; treat as success so higher-level logic continues
+            return
+
+        # Special-case rsync exit 23 to give a clearer explanation
         if base_cmd == "rsync" and rc == 23:
             eprint(
                 "[dir] rsync exit code 23: some files or attributes were NOT transferred.\n"
