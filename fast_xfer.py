@@ -69,7 +69,7 @@ def fmt_cmd(cmd: Iterable[str]) -> str:
 def run_checked(cmd: List[str], *, capture: bool = False, env: Optional[Dict[str, str]] = None) -> str:
     eprint("+", fmt_cmd(cmd))
     if capture:
-        p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=env)
         return (p.stdout or "") + (p.stderr or "")
     subprocess.run(cmd, check=True, env=env)
     return ""
@@ -82,7 +82,7 @@ def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None, timeout:
     Detects out-of-space errors (ENOSPC) and provides clear diagnostics.
     """
     eprint("+", fmt_cmd(cmd))
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=env)
     assert p.stdout is not None
     
     # If timeout is set, use a thread to monitor and kill if needed
@@ -276,8 +276,9 @@ def get_mount_info(path: str) -> Optional[Tuple[str, str, str]]:
         # findmnt -n -o SOURCE,TARGET,FSTYPE <path>
         result = subprocess.run(
             ["findmnt", "-n", "-o", "SOURCE,TARGET,FSTYPE", path],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5,  # Increased timeout for domain mounts
         )
         if result.returncode == 0 and result.stdout:
@@ -451,7 +452,7 @@ def pick_ssh_cipher(user: str, host: str, connect_timeout: int, control_path: Op
     for c in candidates:
         cmd = ssh_base_args(connect_timeout, c, control_path) + [f"{user}@{host}", "true"]
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, timeout=connect_timeout)
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, universal_newlines=True, timeout=connect_timeout)
             eprint(f"[ssh] Selected cipher: {c}")
             return c
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
@@ -815,7 +816,7 @@ def local_cpu_count() -> int:
 
 def remote_capture(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], cmd: str) -> str:
     full = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", cmd]
-    p = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     if p.returncode != 0:
         raise RuntimeError(f"remote command failed: {cmd}\n{p.stderr.strip()}")
     return (p.stdout or "").strip()
@@ -1928,7 +1929,7 @@ def get_remote_available_space(user: str, host: str, connect_timeout: int, ciphe
             f"{user}@{host}",
             f"df -B1 {path_q} 2>/dev/null | tail -1 | awk '{{print $4}}' || echo 'ERROR'"
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=connect_timeout + 5)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=connect_timeout + 5)
         if result.returncode == 0 and result.stdout.strip() and result.stdout.strip() != "ERROR":
             try:
                 return int(result.stdout.strip())
@@ -2827,18 +2828,18 @@ rmdir {stage_q} 2>/dev/null || true
 
 
 def sha256sum_local(path: Path) -> str:
-    h = subprocess.run(["sha256sum", str(path)], check=True, stdout=subprocess.PIPE, text=True).stdout.strip().split()[0]
+    h = subprocess.run(["sha256sum", str(path)], check=True, stdout=subprocess.PIPE, universal_newlines=True).stdout.strip().split()[0]
     return h
 
 
 def sha256sum_remote(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], remote_path: str) -> str:
     cmd = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", f"sha256sum {shlex.quote(remote_path)} | awk '{{print $1}}'"]
-    out = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+    out = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
     return out
 
 
 def sha256sum_local_path(path: str) -> str:
-    h = subprocess.run(["sha256sum", path], check=True, stdout=subprocess.PIPE, text=True).stdout.strip().split()[0]
+    h = subprocess.run(["sha256sum", path], check=True, stdout=subprocess.PIPE, universal_newlines=True).stdout.strip().split()[0]
     return h
 
 
