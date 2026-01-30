@@ -2006,11 +2006,78 @@ def check_destination_space(
         return (True, available, None)
 
 
+def cleanup_old_temp_dirs(workdir: Path, max_age_hours: int = 24, pattern: str = ".xfer_*") -> int:
+    """
+    Clean up old temporary transfer directories in workdir.
+    
+    Args:
+        workdir: Directory to search for old temp dirs
+        max_age_hours: Remove directories older than this many hours (default: 24)
+        pattern: Glob pattern to match temp directories (default: ".xfer_*")
+    
+    Returns:
+        Number of directories removed
+    """
+    if not workdir.exists():
+        return 0
+    
+    removed = 0
+    max_age_seconds = max_age_hours * 3600
+    current_time = time.time()
+    
+    try:
+        for temp_dir in workdir.glob(pattern):
+            if not temp_dir.is_dir():
+                continue
+            
+            try:
+                # Get directory modification time (or creation time if mtime is newer)
+                dir_mtime = temp_dir.stat().st_mtime
+                age_seconds = current_time - dir_mtime
+                
+                if age_seconds > max_age_seconds:
+                    # Directory is old enough to remove
+                    try:
+                        # Remove all contents first
+                        for child in temp_dir.rglob("*"):
+                            try:
+                                if child.is_file():
+                                    child.unlink()
+                                elif child.is_dir():
+                                    child.rmdir()
+                            except Exception:
+                                pass
+                        # Remove the directory itself
+                        temp_dir.rmdir()
+                        removed += 1
+                        eprint(f"[cleanup] Removed old temp directory: {temp_dir} (age: {age_seconds/3600:.1f}h)")
+                    except Exception as e:
+                        eprint(f"[cleanup] Warning: Could not remove {temp_dir}: {e}")
+            except Exception:
+                pass  # Skip directories we can't stat
+    
+    except Exception as e:
+        eprint(f"[cleanup] Warning: Error during cleanup scan: {e}")
+    
+    return removed
+
+
 def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, dest_dir: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
     src = Path(args.source).resolve()
+    tmpdir: Optional[Path] = None
+    cleanup_tmpdir = False
+    
     if args.workdir:
         workdir = Path(args.workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up old temp directories to prevent disk space issues
+        max_age = getattr(args, 'cleanup_max_age_hours', 24)
+        if max_age > 0:
+            removed = cleanup_old_temp_dirs(workdir, max_age_hours=max_age)
+            if removed > 0:
+                eprint(f"[chunked] Cleaned up {removed} old temporary directories from {workdir}")
+        
         tmpdir = workdir / f".xfer_{src.name}_{int(time.time())}"
         tmpdir.mkdir(parents=True, exist_ok=True)
         cleanup_tmpdir = args.cleanup_workdir
@@ -2020,13 +2087,15 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_{src.name}_", dir=temp_base))
         cleanup_tmpdir = True
 
-    part_prefix = tmpdir / "part."
-    parts = split_file(src, part_prefix, args.chunk_size, parallel=args.parallel)
+    # Wrap main logic in try/finally to ensure cleanup on failure
+    try:
+        part_prefix = tmpdir / "part."
+        parts = split_file(src, part_prefix, args.chunk_size, parallel=args.parallel)
 
-    parts_to_send: List[Path] = parts
-    if args.compress_chunks:
-        compressor = args.compressor
-        comp_info = get_compressor_cmd(compressor)
+        parts_to_send: List[Path] = parts
+        if args.compress_chunks:
+            compressor = args.compressor
+            comp_info = get_compressor_cmd(compressor)
         if not comp_info:
             raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
         
@@ -2054,18 +2123,18 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         
         parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts, compression_threads=getattr(args, 'compression_threads', None))
 
-    # Determine staging directory: for NFS destinations, stage on local disk for faster assembly
-    stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
-    if not stage_base:
-        if is_local:
-            # Check if destination is on NFS mount
-            nfs_info = get_nfs_info(dest_dir)
-            if nfs_info:
-                # NFS mount detected - stage on local disk for faster concatenation
-                stage_base = "/var/tmp"
-                eprint(f"[chunked] NFS mount detected at destination - staging on {stage_base} for faster assembly")
-            else:
-                stage_base = dest_dir
+        # Determine staging directory: for NFS destinations, stage on local disk for faster assembly
+        stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
+        if not stage_base:
+            if is_local:
+                # Check if destination is on NFS mount
+                nfs_info = get_nfs_info(dest_dir)
+                if nfs_info:
+                    # NFS mount detected - stage on local disk for faster concatenation
+                    stage_base = "/var/tmp"
+                    eprint(f"[chunked] NFS mount detected at destination - staging on {stage_base} for faster assembly")
+                else:
+                    stage_base = dest_dir
         else:
             # Remote: detect filesystem type
             assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
@@ -2076,42 +2145,42 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             else:
                 stage_base = dest_dir
 
-    stage_dir = f"{stage_base.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
-    if is_local:
-        local_mkdir_p(stage_dir)
-    else:
-        assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
-        remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, stage_dir)
+        stage_dir = f"{stage_base.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
+        if is_local:
+            local_mkdir_p(stage_dir)
+        else:
+            assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+            remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, stage_dir)
 
-    # Use rsync compression for chunked transfers if enabled (only for uncompressed files)
-    use_rsync_compress = args.rsync_compress if hasattr(args, 'rsync_compress') and not args.compress_chunks else False
-    rsync_comp_level = args.rsync_compress_level if hasattr(args, 'rsync_compress_level') else 1
-    operation_timeout = getattr(args, 'rsync_operation_timeout', None) or getattr(args, 'rsync_timeout', None)
-    max_retries = getattr(args, 'rsync_max_retries', 1)  # Use 1 for parallel transfers (retry is per-file)
-    rsync_many_parallel(
-        parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout,
-        use_rsync_compress, rsync_comp_level,
-        operation_timeout=operation_timeout,
-        max_retries=max_retries,
-    )
+        # Use rsync compression for chunked transfers if enabled (only for uncompressed files)
+        use_rsync_compress = args.rsync_compress if hasattr(args, 'rsync_compress') and not args.compress_chunks else False
+        rsync_comp_level = args.rsync_compress_level if hasattr(args, 'rsync_compress_level') else 1
+        operation_timeout = getattr(args, 'rsync_operation_timeout', None) or getattr(args, 'rsync_timeout', None)
+        max_retries = getattr(args, 'rsync_max_retries', 1)  # Use 1 for parallel transfers (retry is per-file)
+        rsync_many_parallel(
+            parts_to_send, is_local, user, host, stage_dir, ssh_e, args.parallel, args.rsync_timeout,
+            use_rsync_compress, rsync_comp_level,
+            operation_timeout=operation_timeout,
+            max_retries=max_retries,
+        )
 
-    # Reassemble file on destination
-    stage_q = shlex.quote(stage_dir)
-    dest_q = shlex.quote(dest_file)
-    if args.compress_chunks:
-        compressor = args.compressor
-        _, decomp_cmd, ext = get_compressor_cmd(compressor) or (None, None, None)
-        
-        if args.keep_compressed:
-            # Keep compressed chunks and concatenate them - USE SEQUENTIAL CAT (safer for compressed files)
-            # Note: Parallel dd can corrupt compressed files due to race conditions
-            eprint(f"[chunked] Keeping compressed chunks and concatenating to {dest_q}{ext}...")
-            if compressor == "zstd":
-                pattern = "part.*.zst"
-            elif compressor in ("pigz", "gzip"):
-                pattern = "part.*.gz"
-            else:
-                pattern = f"part.*{ext}"
+        # Reassemble file on destination
+        stage_q = shlex.quote(stage_dir)
+        dest_q = shlex.quote(dest_file)
+        if args.compress_chunks:
+            compressor = args.compressor
+            _, decomp_cmd, ext = get_compressor_cmd(compressor) or (None, None, None)
+            
+            if args.keep_compressed:
+                # Keep compressed chunks and concatenate them - USE SEQUENTIAL CAT (safer for compressed files)
+                # Note: Parallel dd can corrupt compressed files due to race conditions
+                eprint(f"[chunked] Keeping compressed chunks and concatenating to {dest_q}{ext}...")
+                if compressor == "zstd":
+                    pattern = "part.*.zst"
+                elif compressor in ("pigz", "gzip"):
+                    pattern = "part.*.gz"
+                else:
+                    pattern = f"part.*{ext}"
             
             # Check if staging and destination are different (e.g., staged on /var/tmp, dest on NFS)
             final_dest = f"{dest_q}{ext}"
@@ -2308,22 +2377,22 @@ mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
-    else:
-        # Uncompressed chunks: use parallel dd-based concatenation if possible
-        can_parallel = False
-        if not is_local:
-            has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
-            has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
-            can_parallel = has_dd and has_xargs
         else:
-            can_parallel = which("dd") is not None and which("xargs") is not None
-        
-        assemble_parallel = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
-        
-        if can_parallel:
-            # PARALLEL MODE: Use dd seek to write chunks in parallel (with job limit)
-            eprint(f"[chunked] Using parallel dd-based concatenation for uncompressed chunks ({assemble_parallel} workers)")
-            bs = 4 * 1024 * 1024  # 4MiB block size
+            # Uncompressed chunks: use parallel dd-based concatenation if possible
+            can_parallel = False
+            if not is_local:
+                has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
+                has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
+                can_parallel = has_dd and has_xargs
+            else:
+                can_parallel = which("dd") is not None and which("xargs") is not None
+            
+            assemble_parallel = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
+            
+            if can_parallel:
+                # PARALLEL MODE: Use dd seek to write chunks in parallel (with job limit)
+                eprint(f"[chunked] Using parallel dd-based concatenation for uncompressed chunks ({assemble_parallel} workers)")
+                bs = 4 * 1024 * 1024  # 4MiB block size
             
             assemble_cmd = f"""
 set -euo pipefail
@@ -2363,10 +2432,10 @@ rm -f "${{files[@]}}"
 cd /
 rmdir {stage_q} || true
 """
-        else:
-            # FALLBACK: Sequential cat (if dd/xargs not available)
-            eprint(f"[chunked] Parallel concatenation unavailable (missing dd/xargs) - using sequential cat")
-            assemble_cmd = f"""
+            else:
+                # FALLBACK: Sequential cat (if dd/xargs not available)
+                eprint(f"[chunked] Parallel concatenation unavailable (missing dd/xargs) - using sequential cat")
+                assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -2379,31 +2448,53 @@ mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
-    if is_local:
-        run_checked(["bash", "-c", assemble_cmd])
-    else:
-        run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", assemble_cmd])
+        if is_local:
+            run_checked(["bash", "-c", assemble_cmd])
+        else:
+            run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", assemble_cmd])
 
-    if args.cleanup_local_parts:
-        for p in parts_to_send:
+        if args.cleanup_local_parts:
+            for p in parts_to_send:
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
             try:
-                p.unlink()
-            except FileNotFoundError:
+                for child in tmpdir.glob("*"):
+                    child.unlink()
+                tmpdir.rmdir()
+            except Exception:
                 pass
-        try:
-            for child in tmpdir.glob("*"):
-                child.unlink()
-            tmpdir.rmdir()
-        except Exception:
-            pass
-    if cleanup_tmpdir:
-        try:
-            for child in tmpdir.glob("*"):
-                child.unlink()
-            tmpdir.rmdir()
-            eprint(f"[chunked] Cleaned up temporary directory: {tmpdir}")
-        except Exception:
-            pass
+    finally:
+        # Always attempt cleanup, even on failure, to prevent disk space issues
+        if tmpdir and tmpdir.exists():
+            if cleanup_tmpdir or not args.workdir:
+                # Clean up if explicitly requested, or if using system temp (always cleanup system temp)
+                try:
+                    for child in tmpdir.glob("*"):
+                        try:
+                            if child.is_file():
+                                child.unlink()
+                            elif child.is_dir():
+                                # Try to remove directory contents first
+                                for subchild in child.rglob("*"):
+                                    try:
+                                        if subchild.is_file():
+                                            subchild.unlink()
+                                        elif subchild.is_dir():
+                                            subchild.rmdir()
+                                    except Exception:
+                                        pass
+                                child.rmdir()
+                        except Exception:
+                            pass
+                    tmpdir.rmdir()
+                    eprint(f"[chunked] Cleaned up temporary directory: {tmpdir}")
+                except Exception as e:
+                    eprint(f"[chunked] Warning: Could not fully clean up {tmpdir}: {e}")
+            else:
+                # Using workdir without --cleanup-workdir: just log it for manual cleanup
+                eprint(f"[chunked] Temporary directory left at: {tmpdir} (use --cleanup-workdir to auto-cleanup)")
 
 
 def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str],
@@ -2991,6 +3082,7 @@ def main() -> int:
     p.add_argument("--rsync-no-inc-recursive", action="store_true", help="Use --no-inc-recursive to prevent deep recursion hangs on large NAS directories (recommended for NAS mounts)")
     p.add_argument("--workdir", default=None, help="Working directory for artifacts/parts (default: alongside source, or temp for chunked)")
     p.add_argument("--cleanup-workdir", action="store_true", help="If --workdir is used with chunked, remove temp subdir after success")
+    p.add_argument("--cleanup-max-age-hours", type=int, default=24, help="Auto-cleanup temp directories older than this many hours in --workdir (default: 24, set to 0 to disable)")
     p.add_argument("--compressor", choices=["zstd", "pigz", "gzip"], default="pigz", help="Compression algorithm (pigz=fast parallel gzip, zstd=better ratio, gzip=fallback)")
     p.add_argument("--compression-level", type=int, default=6, help="Compression level (1=fast, 6=default for pigz/gzip, 3=default for zstd)")
     p.add_argument("--compression-threads", type=int, default=0, help="Threads for compression (0=auto, pigz only)")
