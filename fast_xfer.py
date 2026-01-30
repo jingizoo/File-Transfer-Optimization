@@ -2097,32 +2097,32 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
         if args.compress_chunks:
             compressor = args.compressor
             comp_info = get_compressor_cmd(compressor)
-        if not comp_info:
-            raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
-        
-        _, decomp_cmd, ext = comp_info
-        
-        if not is_local:
-            assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
-            # Check for decompressor on remote
-            if compressor == "zstd":
-                remote_cmd_check = "zstd"
-            elif compressor in ("pigz", "gzip"):
-                remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
-            else:
-                remote_cmd_check = decomp_cmd
+            if not comp_info:
+                raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
             
-            if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
-                raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+            _, decomp_cmd, ext = comp_info
             
-            # For zstd turbo mode (dd-based assembly), also check for dd and xargs
-            if compressor == "zstd" and not args.keep_compressed:
-                if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd"):
-                    eprint(f"[chunked] WARNING: 'dd' not found on remote - turbo mode (dd-based assembly) will be disabled")
-                if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs"):
-                    eprint(f"[chunked] WARNING: 'xargs' not found on remote - turbo mode (dd-based assembly) will be disabled")
-        
-        parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts, compression_threads=getattr(args, 'compression_threads', None))
+            if not is_local:
+                assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+                # Check for decompressor on remote
+                if compressor == "zstd":
+                    remote_cmd_check = "zstd"
+                elif compressor in ("pigz", "gzip"):
+                    remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+                else:
+                    remote_cmd_check = decomp_cmd
+                
+                if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                    raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+                
+                # For zstd turbo mode (dd-based assembly), also check for dd and xargs
+                if compressor == "zstd" and not args.keep_compressed:
+                    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd"):
+                        eprint(f"[chunked] WARNING: 'dd' not found on remote - turbo mode (dd-based assembly) will be disabled")
+                    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs"):
+                        eprint(f"[chunked] WARNING: 'xargs' not found on remote - turbo mode (dd-based assembly) will be disabled")
+            
+            parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts, compression_threads=getattr(args, 'compression_threads', None))
 
         # Determine staging directory: for NFS destinations, stage on local disk for faster assembly
         stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
