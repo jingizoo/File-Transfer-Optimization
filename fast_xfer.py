@@ -2070,7 +2070,21 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
     
     if args.workdir:
         workdir = Path(args.workdir).resolve()
-        workdir.mkdir(parents=True, exist_ok=True)
+        
+        # Safety check: don't allow root directory
+        if str(workdir) == "/":
+            raise RuntimeError(f"ERROR: --workdir cannot be root directory (/). Please specify a subdirectory like /tmp or /var/tmp")
+        
+        # Ensure workdir exists and is writable
+        try:
+            workdir.mkdir(parents=True, exist_ok=True)
+            # Test write access
+            test_file = workdir / f".test_write_{os.getpid()}"
+            test_file.touch()
+            test_file.unlink()
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"ERROR: Cannot create or write to --workdir {workdir}: {e}\n"
+                             f"       Please specify a writable directory or use --temp-dir instead.")
         
         # Clean up old temp directories to prevent disk space issues
         max_age = getattr(args, 'cleanup_max_age_hours', 24)
@@ -2080,12 +2094,27 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
                 eprint(f"[chunked] Cleaned up {removed} old temporary directories from {workdir}")
         
         tmpdir = workdir / f".xfer_{src.name}_{int(time.time())}"
-        tmpdir.mkdir(parents=True, exist_ok=True)
+        try:
+            tmpdir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"ERROR: Cannot create temporary directory {tmpdir}: {e}\n"
+                             f"       Check permissions on --workdir {workdir}")
         cleanup_tmpdir = args.cleanup_workdir
     else:
         # Use user-specified temp dir or system default (respects TMPDIR env var)
         temp_base = args.temp_dir if hasattr(args, 'temp_dir') and args.temp_dir else tempfile.gettempdir()
-        tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_{src.name}_", dir=temp_base))
+        
+        # Safety check: ensure temp_base is not root
+        if temp_base == "/" or str(Path(temp_base).resolve()) == "/":
+            # Fallback to /tmp if root is detected
+            temp_base = "/tmp"
+            eprint(f"[chunked] WARNING: temp directory resolved to root (/), using /tmp instead")
+        
+        try:
+            tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_{src.name}_", dir=temp_base))
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"ERROR: Cannot create temporary directory in {temp_base}: {e}\n"
+                             f"       Try specifying --workdir or --temp-dir to a writable directory")
         cleanup_tmpdir = True
 
     # Wrap main logic in try/finally to ensure cleanup on failure
@@ -2136,15 +2165,27 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
                     eprint(f"[chunked] NFS mount detected at destination - staging on {stage_base} for faster assembly")
                 else:
                     stage_base = dest_dir
-        else:
-            # Remote: detect filesystem type
-            assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
-            dest_fs = remote_fs_type(user, host, args.connect_timeout, cipher, control_path, dest_dir)
-            if "nfs" in dest_fs.lower():
-                stage_base = "/var/tmp"
-                eprint(f"[chunked] Remote NFS detected - staging on {stage_base} for faster assembly")
             else:
+                # Remote: detect filesystem type
+                assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
+                dest_fs = remote_fs_type(user, host, args.connect_timeout, cipher, control_path, dest_dir)
+                if "nfs" in dest_fs.lower():
+                    stage_base = "/var/tmp"
+                    eprint(f"[chunked] Remote NFS detected - staging on {stage_base} for faster assembly")
+                else:
+                    stage_base = dest_dir
+        else:
+            # User explicitly specified remote_stage_base, use it as-is
+            pass
+
+        # Safety check: ensure stage_base is valid and not root
+        if not stage_base or stage_base == "/":
+            # Fallback to /tmp for remote, or dest_dir for local
+            if is_local:
                 stage_base = dest_dir
+            else:
+                stage_base = "/tmp"
+                eprint(f"[chunked] WARNING: stage_base was invalid, using {stage_base} instead")
 
         stage_dir = f"{stage_base.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
         if is_local:
@@ -2589,6 +2630,11 @@ def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str]
         else:
             stage_base = dest_dir
 
+    # Safety check: ensure stage_base is valid and not root
+    if not stage_base or stage_base == "/":
+        stage_base = "/tmp"
+        eprint(f"[turbo] WARNING: stage_base was invalid, using {stage_base} instead")
+
     stage_dir = f"{stage_base.rstrip('/')}/._xfer_{src.name}_{int(time.time())}"
     eprint(f"[turbo] src={src.name} size={human_bytes(src_size)} chunks={n_chunks} chunk={human_bytes(chunk_bytes)} bs={human_bytes(bs_bytes)}")
     eprint(f"[turbo] parallel={parallel} comp_threads/job={comp_threads} assemble_parallel={assemble_parallel} decomp_threads/job={decomp_threads}")
@@ -2599,13 +2645,43 @@ def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str]
     # Local workdir for transient compressed chunks
     if args.workdir:
         workdir = Path(args.workdir).resolve()
-        workdir.mkdir(parents=True, exist_ok=True)
+        
+        # Safety check: don't allow root directory
+        if str(workdir) == "/":
+            raise RuntimeError(f"ERROR: --workdir cannot be root directory (/). Please specify a subdirectory like /tmp or /var/tmp")
+        
+        # Ensure workdir exists and is writable
+        try:
+            workdir.mkdir(parents=True, exist_ok=True)
+            # Test write access
+            test_file = workdir / f".test_write_{os.getpid()}"
+            test_file.touch()
+            test_file.unlink()
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"ERROR: Cannot create or write to --workdir {workdir}: {e}\n"
+                             f"       Please specify a writable directory or use --temp-dir instead.")
+        
         tmpdir = workdir / f".xfer_turbo_{src.name}_{int(time.time())}"
-        tmpdir.mkdir(parents=True, exist_ok=True)
+        try:
+            tmpdir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"ERROR: Cannot create temporary directory {tmpdir}: {e}\n"
+                             f"       Check permissions on --workdir {workdir}")
         cleanup_tmpdir = getattr(args, "cleanup_workdir", False)
     else:
         temp_base = getattr(args, "temp_dir", None) or tempfile.gettempdir()
-        tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_turbo_{src.name}_", dir=temp_base))
+        
+        # Safety check: ensure temp_base is not root
+        if temp_base == "/" or str(Path(temp_base).resolve()) == "/":
+            # Fallback to /tmp if root is detected
+            temp_base = "/tmp"
+            eprint(f"[turbo] WARNING: temp directory resolved to root (/), using /tmp instead")
+        
+        try:
+            tmpdir = Path(tempfile.mkdtemp(prefix=f"xfer_turbo_{src.name}_", dir=temp_base))
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"ERROR: Cannot create temporary directory in {temp_base}: {e}\n"
+                             f"       Try specifying --workdir or --temp-dir to a writable directory")
         cleanup_tmpdir = True
 
     dest_stage = f"{user}@{host}:{stage_dir.rstrip('/')}/"
