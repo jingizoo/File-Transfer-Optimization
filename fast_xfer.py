@@ -2150,24 +2150,23 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             if not is_local:
                 assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
                 # Check for decompressor on remote
-                # If using Python zstd library locally and keeping compressed, we don't need remote decompressor
-                if compressor == "zstd":
-                    if HAS_ZSTD_LIB and args.keep_compressed:
-                        # Using Python zstd library and keeping compressed - no remote decompression needed
-                        eprint(f"[chunked] Using Python zstandard library locally; keeping compressed on remote (no remote decompressor needed)")
-                    else:
-                        # Need remote zstd CLI for decompression
+                # If --keep-compressed is set, we don't need remote decompressor (chunks stay compressed)
+                if args.keep_compressed:
+                    eprint(f"[chunked] --keep-compressed specified - compressed chunks will remain compressed on destination (no remote decompressor needed)")
+                else:
+                    # Need remote decompressor for decompression/reassembly
+                    if compressor == "zstd":
                         remote_cmd_check = "zstd"
                         if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
                             raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
-                elif compressor in ("pigz", "gzip"):
-                    remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
-                    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
-                        raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
-                else:
-                    remote_cmd_check = decomp_cmd
-                    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
-                        raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+                    elif compressor in ("pigz", "gzip"):
+                        remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+                        if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                            raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+                    else:
+                        remote_cmd_check = decomp_cmd
+                        if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                            raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
                 
                 # For zstd turbo mode (dd-based assembly), also check for dd and xargs
                 if compressor == "zstd" and not args.keep_compressed:
