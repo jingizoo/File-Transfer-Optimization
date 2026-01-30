@@ -1687,9 +1687,15 @@ def compress_parts(parts: List[Path], compressor: str, level: int, parallel: int
         if compressor == "zstd":
             if HAS_ZSTD_LIB:
                 # Use Python zstandard library for per-chunk compression
+                if not hasattr(compress_parts, "_python_zstd_logged"):
+                    eprint(f"[chunked] Using Python zstandard library for compression (no CLI zstd needed on source)")
+                    compress_parts._python_zstd_logged = True
                 compress_file_python_zstd(p, comp_file, level, comp_threads)
             else:
                 # Use CLI zstd
+                if not hasattr(compress_parts, "_cli_zstd_logged"):
+                    eprint(f"[chunked] Using CLI zstd tool for compression")
+                    compress_parts._cli_zstd_logged = True
                 run_checked([comp_cmd, f"-{level}", f"-T{comp_threads}", "--no-progress", "-o", str(comp_file), str(p)])
         elif compressor == "pigz":
             # pigz -c reads from stdin, so redirect input
@@ -2127,22 +2133,41 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             compressor = args.compressor
             comp_info = get_compressor_cmd(compressor)
             if not comp_info:
-                raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
+                if compressor == "zstd":
+                    raise RuntimeError(f"Chunk compression requires zstd on SOURCE.\n"
+                                     f"  Options:\n"
+                                     f"  1. Install Python zstandard library: pip install zstandard\n"
+                                     f"  2. Install CLI zstd tool: yum install zstd (or apt-get install zstd)")
+                else:
+                    raise RuntimeError(f"Chunk compression requires {compressor} installed on SOURCE.")
+            
+            # Log which method we're using
+            if compressor == "zstd" and HAS_ZSTD_LIB:
+                eprint(f"[chunked] Python zstandard library detected - will use Python library for compression")
             
             _, decomp_cmd, ext = comp_info
             
             if not is_local:
                 assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
                 # Check for decompressor on remote
+                # If using Python zstd library locally and keeping compressed, we don't need remote decompressor
                 if compressor == "zstd":
-                    remote_cmd_check = "zstd"
+                    if HAS_ZSTD_LIB and args.keep_compressed:
+                        # Using Python zstd library and keeping compressed - no remote decompression needed
+                        eprint(f"[chunked] Using Python zstandard library locally; keeping compressed on remote (no remote decompressor needed)")
+                    else:
+                        # Need remote zstd CLI for decompression
+                        remote_cmd_check = "zstd"
+                        if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                            raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
                 elif compressor in ("pigz", "gzip"):
                     remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
+                    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                        raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
                 else:
                     remote_cmd_check = decomp_cmd
-                
-                if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
-                    raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
+                    if not remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
+                        raise RuntimeError(f"Chunk compression requires {compressor} decompressor ({remote_cmd_check}) installed on TARGET as well.")
                 
                 # For zstd turbo mode (dd-based assembly), also check for dd and xargs
                 if compressor == "zstd" and not args.keep_compressed:
@@ -3150,6 +3175,15 @@ def process_single_source(
 
 
 def main() -> int:
+    # Diagnostic: show zstd availability
+    if "--compressor" in sys.argv and "zstd" in sys.argv:
+        if HAS_ZSTD_LIB:
+            eprint("[info] Python zstandard library is available - will use Python library for compression")
+        elif which("zstd"):
+            eprint("[info] CLI zstd tool is available - will use CLI tool for compression")
+        else:
+            eprint("[info] WARNING: Neither Python zstandard library nor CLI zstd tool found")
+    
     p = argparse.ArgumentParser(
         description="Highly-tuned Linux-to-Linux file transfer wrapper (rsync/ssh, optional zstd, optional chunk parallelism).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
