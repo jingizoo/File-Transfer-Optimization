@@ -2154,7 +2154,13 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts, compression_threads=getattr(args, 'compression_threads', None))
 
         # Determine staging directory: for NFS destinations, stage on local disk for faster assembly
+        # If --workdir is specified and --remote-stage-base is not, use workdir for remote staging too
         stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
+        if not stage_base and args.workdir and not is_local:
+            # Use workdir as remote staging base if not explicitly overridden
+            stage_base = str(Path(args.workdir).resolve())
+            eprint(f"[chunked] Using --workdir {stage_base} as remote staging directory")
+        
         if not stage_base:
             if is_local:
                 # Check if destination is on NFS mount
@@ -2624,6 +2630,11 @@ def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str]
     # Remote staging directory: if destination filesystem is NFS, stage on /var/tmp (local disk) by default.
     dest_fs = remote_fs_type(user, host, args.connect_timeout, cipher, control_path, dest_dir)
     stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
+    # If --workdir is specified and --remote-stage-base is not, use workdir for remote staging too
+    if not stage_base and args.workdir:
+        stage_base = str(Path(args.workdir).resolve())
+        eprint(f"[turbo] Using --workdir {stage_base} as remote staging directory")
+    
     if not stage_base:
         if "nfs" in dest_fs.lower():
             stage_base = "/var/tmp"
