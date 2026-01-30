@@ -2194,8 +2194,8 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             elif compressor in ("pigz", "gzip"):
                 verify_cmd = 'gunzip -t "$first_chunk" >/dev/null 2>&1 || { echo "ERROR: First chunk is corrupted" >&2; exit 1; }'
             
-            if stage_dir != dest_dir:
-                assemble_cmd = f"""
+                if stage_dir != dest_dir:
+                    assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 tmp="tmp_$$.zst"
@@ -2214,8 +2214,8 @@ mv -f "$tmp" {final_dest_q}
 cd /
 rmdir {stage_q} || true
 """
-            else:
-                assemble_cmd = f"""
+                else:
+                    assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={final_dest_q}
@@ -2233,37 +2233,37 @@ mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
-        else:
-            # Decompress and reassemble - OPTIMIZED: use dd-based assembly for zstd (writes directly to final file offsets)
-            eprint(f"[chunked] Reassembling and decompressing file on destination (optimized)...")
-            decomp_threads = get_decompression_threads(getattr(args, 'decompression_threads', None))
-            eprint(f"[chunked] Using {decomp_threads} threads per chunk for parallel decompression")
-            
-            if compressor == "zstd" and not is_local:
-                # Check if remote has dd and xargs for turbo mode
-                has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
-                has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
+            else:
+                # Decompress and reassemble - OPTIMIZED: use dd-based assembly for zstd (writes directly to final file offsets)
+                eprint(f"[chunked] Reassembling and decompressing file on destination (optimized)...")
+                decomp_threads = get_decompression_threads(getattr(args, 'decompression_threads', None))
+                eprint(f"[chunked] Using {decomp_threads} threads per chunk for parallel decompression")
                 
-                if has_dd and has_xargs:
-                    # TURBO MODE: Use dd-based assembly for zstd (writes directly to final file offsets, no temp files)
-                    # This is MUCH faster for huge files - avoids creating temp decompressed chunks
-                    eprint(f"[chunked] Using TURBO mode: dd-based assembly (writes directly to final file, no temp decompressed chunks)")
+                if compressor == "zstd" and not is_local:
+                    # Check if remote has dd and xargs for turbo mode
+                    has_dd = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "dd")
+                    has_xargs = remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, "xargs")
                     
-                    # Parse chunk size to bytes for dd block size calculation
-                    chunk_size_bytes = parse_size_to_bytes(args.chunk_size) if hasattr(args, 'chunk_size') else 20 * 1024**3
-                    src_size = src.stat().st_size
-                    
-                    # Choose dd block size that divides chunk size (prefer 4MiB, fallback to 1MiB)
-                    bs = 4 * 1024 * 1024  # 4MiB
-                    if chunk_size_bytes % bs != 0:
-                        bs = 1 * 1024 * 1024  # 1MiB
-                    if chunk_size_bytes % bs != 0:
-                        bs = 1024 * 1024  # Ensure it works
-                    
-                    chunk_blocks = chunk_size_bytes // bs
-                    remote_jobs = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
-                    
-                    assemble_cmd = f"""
+                    if has_dd and has_xargs:
+                        # TURBO MODE: Use dd-based assembly for zstd (writes directly to final file offsets, no temp files)
+                        # This is MUCH faster for huge files - avoids creating temp decompressed chunks
+                        eprint(f"[chunked] Using TURBO mode: dd-based assembly (writes directly to final file, no temp decompressed chunks)")
+                        
+                        # Parse chunk size to bytes for dd block size calculation
+                        chunk_size_bytes = parse_size_to_bytes(args.chunk_size) if hasattr(args, 'chunk_size') else 20 * 1024**3
+                        src_size = src.stat().st_size
+                        
+                        # Choose dd block size that divides chunk size (prefer 4MiB, fallback to 1MiB)
+                        bs = 4 * 1024 * 1024  # 4MiB
+                        if chunk_size_bytes % bs != 0:
+                            bs = 1 * 1024 * 1024  # 1MiB
+                        if chunk_size_bytes % bs != 0:
+                            bs = 1024 * 1024  # Ensure it works
+                        
+                        chunk_blocks = chunk_size_bytes // bs
+                        remote_jobs = max(1, min(args.parallel, 8))  # Cap at 8 parallel jobs
+                        
+                        assemble_cmd = f"""
 set -euo pipefail
 stage={stage_q}
 dest={dest_q}
@@ -2313,13 +2313,13 @@ rm -f part.*.zst
 cd /
 rmdir "$stage" 2>/dev/null || true
 """
-                else:
-                    # Fall back to standard mode if dd/xargs not available
-                    eprint(f"[chunked] Turbo mode unavailable (missing dd/xargs) - using standard assembly")
-                    decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
-                    pattern = "part.*.zst"
-                    
-                    assemble_cmd = f"""
+                    else:
+                        # Fall back to standard mode if dd/xargs not available
+                        eprint(f"[chunked] Turbo mode unavailable (missing dd/xargs) - using standard assembly")
+                        decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
+                        pattern = "part.*.zst"
+                        
+                        assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -2342,19 +2342,19 @@ mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
-            else:
-                # Standard mode: decompress in parallel, then concatenate
-                if compressor == "zstd":
-                    decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
-                    pattern = "part.*.zst"
-                elif compressor in ("pigz", "gzip"):
-                    decomp_cmd_str = f"pigz -d -c -p {decomp_threads} 2>/dev/null || gunzip -c || gzip -d -c"
-                    pattern = "part.*.gz"
                 else:
-                    decomp_cmd_str = f"{decomp_cmd} -d -c"
-                    pattern = f"part.*{ext}"
-                
-                assemble_cmd = f"""
+                    # Standard mode: decompress in parallel, then concatenate
+                    if compressor == "zstd":
+                        decomp_cmd_str = f"zstd -d -c -T{decomp_threads} --fast"
+                        pattern = "part.*.zst"
+                    elif compressor in ("pigz", "gzip"):
+                        decomp_cmd_str = f"pigz -d -c -p {decomp_threads} 2>/dev/null || gunzip -c || gzip -d -c"
+                        pattern = "part.*.gz"
+                    else:
+                        decomp_cmd_str = f"{decomp_cmd} -d -c"
+                        pattern = f"part.*{ext}"
+                    
+                    assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -2393,8 +2393,8 @@ rmdir {stage_q} || true
                 # PARALLEL MODE: Use dd seek to write chunks in parallel (with job limit)
                 eprint(f"[chunked] Using parallel dd-based concatenation for uncompressed chunks ({assemble_parallel} workers)")
                 bs = 4 * 1024 * 1024  # 4MiB block size
-            
-            assemble_cmd = f"""
+                
+                assemble_cmd = f"""
 set -euo pipefail
 cd {stage_q}
 dest={dest_q}
@@ -2448,6 +2448,7 @@ mv -f "$tmp" "$dest"
 cd /
 rmdir {stage_q} || true
 """
+        # Execute assemble_cmd (common for both compress_chunks and uncompressed paths)
         if is_local:
             run_checked(["bash", "-c", assemble_cmd])
         else:
