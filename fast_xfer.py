@@ -917,11 +917,15 @@ def build_rsync_cmd(
     ]
     
     # Connection timeout - prevents hanging on initial connection
-    if contimeout:
-        cmd.append(f"--contimeout={contimeout}")
-    elif timeout > 0:
-        # Default contimeout to same as timeout if not specified
-        cmd.append(f"--contimeout={timeout}")
+    # NOTE: --contimeout is ONLY valid for rsync daemon transports (rsync:// or host::module)
+    # It is NOT valid for SSH transports (when ssh_e is provided)
+    # For SSH, connection timeout is handled by SSH itself via ConnectTimeout
+    if not ssh_e:  # Only add --contimeout for daemon transports (no SSH)
+        if contimeout:
+            cmd.append(f"--contimeout={contimeout}")
+        elif timeout > 0:
+            # Default contimeout to same as timeout if not specified
+            cmd.append(f"--contimeout={timeout}")
     
     # Prevent deep recursion hangs - use non-incremental recursion for large directories
     if no_inc_recursive:
@@ -1808,10 +1812,14 @@ def rsync_many_parallel(
             "--safe-links",  # Prevent following symlinks that point outside tree (anti-hang)
         ]
         # Connection timeout to prevent hanging on initial connection
-        if operation_timeout:
-            cmd.append(f"--contimeout={operation_timeout}")
-        elif rsync_timeout > 0:
-            cmd.append(f"--contimeout={rsync_timeout}")
+        # NOTE: --contimeout is ONLY valid for rsync daemon transports (rsync:// or host::module)
+        # It is NOT valid for SSH transports (when ssh_e is provided)
+        # For SSH, connection timeout is handled by SSH itself via ConnectTimeout
+        if not ssh_e:  # Only add --contimeout for daemon transports (no SSH)
+            if operation_timeout:
+                cmd.append(f"--contimeout={operation_timeout}")
+            elif rsync_timeout > 0:
+                cmd.append(f"--contimeout={rsync_timeout}")
         # Add rsync compression if enabled (for uncompressed files only)
         if rsync_compress and not str(p).endswith(('.gz', '.zst', '.bz2', '.xz', '.zip')):
             # Only compress if file doesn't appear to be already compressed
