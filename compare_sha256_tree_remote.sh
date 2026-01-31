@@ -271,12 +271,35 @@ tmp_list="$(mktemp -t compare_sha256.XXXXXX)"
 cleanup() { rm -f "$tmp_list"; }
 trap cleanup EXIT
 
-# Avoid bash process substitution (`done < <(...)`) because it fails in some shells/environments.
-find "$src_dir" -type f -print0 >"$tmp_list"
-total="$(tr -cd '\0' <"$tmp_list" | wc -c | tr -d '[:space:]')"
+# Build the file list.
+# Default is newline-delimited for broad compatibility (Git-Bash/MSYS can be flaky with NULs).
+# If you need full POSIX safety (handles filenames with newlines), set:
+#   COMPARE_LIST_MODE=print0
+list_mode="${COMPARE_LIST_MODE:-newline}"  # newline | print0
+case "$list_mode" in
+  newline|print0) ;;
+  *)
+    echo "ERROR: invalid COMPARE_LIST_MODE=$list_mode (use: newline|print0)" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$list_mode" == "print0" ]]; then
+  find "$src_dir" -type f -print0 >"$tmp_list"
+  total="$(tr -cd '\0' <"$tmp_list" | wc -c | tr -d '[:space:]')"
+else
+  find "$src_dir" -type f -print >"$tmp_list"
+  total="$(wc -l <"$tmp_list" | tr -d '[:space:]')"
+fi
 idx=0
 
-while IFS= read -r -d '' src_file; do
+while :; do
+  if [[ "$list_mode" == "print0" ]]; then
+    IFS= read -r -d '' src_file || break
+  else
+    IFS= read -r src_file || break
+    [[ -n "$src_file" ]] || continue
+  fi
   ((idx++)) || true
   rel="${src_file#"$src_dir"/}"
   remote_file="$remote_root/$rel"
