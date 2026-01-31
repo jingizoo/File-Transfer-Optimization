@@ -83,14 +83,49 @@ else
 fi
 
 SSH_OPTS=(
-  -o BatchMode=yes
   -o ConnectTimeout=10
-  -o StrictHostKeyChecking=accept-new
 )
 
-if ! ssh "${SSH_OPTS[@]}" "$remote_spec" "true" >/dev/null 2>&1; then
-  echo "ERROR: cannot SSH to $remote_spec (set up key auth and test: ssh $remote_spec true)" >&2
-  exit 3
+batch_mode="${COMPARE_SSH_BATCHMODE:-1}"
+if [[ "$batch_mode" == "1" ]]; then
+  SSH_OPTS+=(-o BatchMode=yes)
+else
+  SSH_OPTS+=(-o BatchMode=no)
+fi
+
+# `StrictHostKeyChecking=accept-new` is only supported on newer OpenSSH.
+ssh_v="$(ssh -V 2>&1 || true)"
+strict_host_key="no"
+if [[ "$ssh_v" =~ OpenSSH_([0-9]+)\.([0-9]+) ]]; then
+  ssh_major="${BASH_REMATCH[1]}"
+  ssh_minor="${BASH_REMATCH[2]}"
+  if (( ssh_major > 7 || (ssh_major == 7 && ssh_minor >= 6) )); then
+    strict_host_key="accept-new"
+  fi
+fi
+SSH_OPTS+=(-o "StrictHostKeyChecking=$strict_host_key")
+
+ssh_test_err="$(ssh "${SSH_OPTS[@]}" "$remote_spec" "true" 2>&1 || true)"
+if [[ -n "$ssh_test_err" ]]; then
+  # If SSH printed anything and exited non-zero, show it to help debugging.
+  if ! ssh "${SSH_OPTS[@]}" "$remote_spec" "true" >/dev/null 2>&1; then
+    echo "ERROR: cannot SSH to $remote_spec" >&2
+    echo "SSH version: $ssh_v" >&2
+    echo "SSH options: ${SSH_OPTS[*]}" >&2
+    echo "SSH error:" >&2
+    echo "$ssh_test_err" >&2
+    echo >&2
+    echo "If SSH works manually because it prompts for a password/passphrase, either:" >&2
+    echo "  - set up SSH keys (recommended), or" >&2
+    echo "  - rerun with interactive SSH: COMPARE_SSH_BATCHMODE=0 ./compare_sha256_tree_remote.sh ..." >&2
+    exit 3
+  fi
+else
+  # No stderr output; still ensure the command succeeds.
+  if ! ssh "${SSH_OPTS[@]}" "$remote_spec" "true" >/dev/null 2>&1; then
+    echo "ERROR: cannot SSH to $remote_spec" >&2
+    exit 3
+  fi
 fi
 
 REMOTE_HASH_TOOL="$(
