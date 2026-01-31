@@ -956,6 +956,8 @@ def build_rsync_cmd(
     rsync_compress: bool = False,
     rsync_compress_level: int = 1,
     extra_args: Optional[List[str]] = None,
+    exclude: Optional[List[str]] = None,
+    exclude_from: Optional[str] = None,
     contimeout: Optional[int] = None,
     no_inc_recursive: bool = False,
     skip_problematic: bool = True,
@@ -1019,6 +1021,12 @@ def build_rsync_cmd(
         cmd.append("--append-verify")
     elif whole_file:
         cmd.append("--whole-file")
+    if exclude:
+        for pat in exclude:
+            if pat:
+                cmd.append(f"--exclude={pat}")
+    if exclude_from:
+        cmd.append(f"--exclude-from={exclude_from}")
     if extra_args:
         cmd.extend(extra_args)
     cmd += [src, dest]
@@ -1271,6 +1279,8 @@ def strategy_dir_rsync(
         rsync_compress=use_rsync_compress,
         rsync_compress_level=rsync_comp_level,
         extra_args=extra_rsync_args or None,
+        exclude=getattr(args, "exclude", None),
+        exclude_from=getattr(args, "exclude_from", None),
         contimeout=contimeout,
         no_inc_recursive=no_inc_recursive,
     )
@@ -3489,6 +3499,18 @@ def main() -> int:
     p.add_argument("--temp-dir", default=None, help="Temporary directory for SSH control sockets (default: system temp, respects TMPDIR env var)")
     p.add_argument("--rsync-compress", action="store_true", help="Use rsync's built-in compression (compresses on-the-fly during transfer, more efficient than pre-compression)")
     p.add_argument("--rsync-compress-level", type=int, default=1, help="rsync compression level (1=fast, 6=better ratio, default: 1)")
+    p.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Rsync exclude pattern (repeatable). Example: --exclude '*.tmp' --exclude 'cache/'",
+    )
+    p.add_argument(
+        "--exclude-from",
+        dest="exclude_from",
+        default=None,
+        help="Path to a file containing rsync exclude patterns (one per line). Passed to rsync as --exclude-from=FILE.",
+    )
     p.add_argument(
         "--allow-rsync-exit-23",
         "--skip-permission-denied",
