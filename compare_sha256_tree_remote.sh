@@ -32,6 +32,13 @@ Example:
 Logging:
   # Log to a file (in addition to stdout)
   COMPARE_LOG_FILE=compare.log ./compare_sha256_tree_remote.sh /data/src user@host:/data/dst
+
+Faster modes (trade accuracy for speed):
+  # Compare only file sizes (very fast, not cryptographic)
+  COMPARE_MODE=size ./compare_sha256_tree_remote.sh /data/src user@host:/data/dst
+
+  # Compare sizes + hash of first+last N MiB (fast, still not a full proof)
+  COMPARE_MODE=sample COMPARE_SAMPLE_MIB=64 ./compare_sha256_tree_remote.sh /data/src user@host:/data/dst
 EOF
 }
 
@@ -157,6 +164,24 @@ missing=0
 errors=0
 
 log_file="${COMPARE_LOG_FILE:-}"
+compare_mode="${COMPARE_MODE:-sha256}"  # sha256 | size | sample
+sample_mib="${COMPARE_SAMPLE_MIB:-64}"
+
+case "$compare_mode" in
+  sha256|size|sample) ;;
+  *)
+    echo "ERROR: invalid COMPARE_MODE=$compare_mode (use: sha256|size|sample)" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$compare_mode" == "sample" ]]; then
+  if ! [[ "$sample_mib" =~ ^[0-9]+$ ]] || (( sample_mib <= 0 )); then
+    echo "ERROR: invalid COMPARE_SAMPLE_MIB=$sample_mib (must be positive integer)" >&2
+    exit 2
+  fi
+fi
+
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 log() {
   if [[ -n "$log_file" ]]; then
@@ -173,11 +198,72 @@ err() {
   fi
 }
 
-log "Comparing SHA-256"
+local_size_bytes() {
+  # Prefer GNU stat; fall back to BSD stat.
+  local p="$1"
+  stat -c '%s' -- "$p" 2>/dev/null || stat -f '%z' -- "$p" 2>/dev/null || echo ""
+}
+
+remote_size_bytes() {
+  local p="$1"
+  ssh "${SSH_OPTS[@]}" "$remote_spec" \
+    "stat -c '%s' -- $(sq "$p") 2>/dev/null || stat -f '%z' -- $(sq "$p") 2>/dev/null" 2>/dev/null || true
+}
+
+local_sample_hash() {
+  local p="$1"
+  local bytes="$2"
+  local smib="$3"
+  local chunk_bytes=$(( smib * 1024 * 1024 ))
+
+  # If file is small-ish, just hash the whole file.
+  if (( bytes <= chunk_bytes * 2 )); then
+    if [[ "$LOCAL_HASH_TOOL" == "sha256sum" ]]; then
+      sha256sum -- "$p" 2>/dev/null | awk '{print $1}'
+    else
+      shasum -a 256 "$p" 2>/dev/null | awk '{print $1}'
+    fi
+    return 0
+  fi
+
+  local skip_mib=$(( (bytes - chunk_bytes) / 1024 / 1024 ))
+  (
+    dd if="$p" bs=1M count="$smib" status=none
+    dd if="$p" bs=1M skip="$skip_mib" count="$smib" status=none
+  ) | sha256sum 2>/dev/null | awk '{print $1}'
+}
+
+remote_sample_hash() {
+  local p="$1"
+  local bytes="$2"
+  local smib="$3"
+  local chunk_bytes=$(( smib * 1024 * 1024 ))
+
+  if (( bytes <= chunk_bytes * 2 )); then
+    if [[ "$REMOTE_HASH_TOOL" == "sha256sum" ]]; then
+      ssh "${SSH_OPTS[@]}" "$remote_spec" "sha256sum -- $(sq "$p") 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true
+    else
+      ssh "${SSH_OPTS[@]}" "$remote_spec" "shasum -a 256 $(sq "$p") 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  local skip_mib=$(( (bytes - chunk_bytes) / 1024 / 1024 ))
+  ssh "${SSH_OPTS[@]}" "$remote_spec" \
+    "(
+       dd if=$(sq "$p") bs=1M count=$smib status=none
+       dd if=$(sq "$p") bs=1M skip=$skip_mib count=$smib status=none
+     ) | sha256sum 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true
+}
+
+log "Comparing mode: $compare_mode"
 log "  source:  $src_dir"
 log "  target:  $remote_spec:$remote_root"
 if [[ -n "$log_file" ]]; then
   log "  log:     $log_file"
+fi
+if [[ "$compare_mode" == "sample" ]]; then
+  log "  sample:  first+last ${sample_mib}MiB"
 fi
 log ""
 
@@ -195,18 +281,8 @@ while IFS= read -r -d '' src_file; do
   rel="${src_file#"$src_dir"/}"
   remote_file="$remote_root/$rel"
 
-  # Local hash
-  if [[ "$LOCAL_HASH_TOOL" == "sha256sum" ]]; then
-    local_out="$(sha256sum -- "$src_file" 2>/dev/null || true)"
-  else
-    local_out="$(shasum -a 256 "$src_file" 2>/dev/null || true)"
-  fi
-  local_hash="${local_out%% *}"
-  if [[ -z "$local_hash" ]]; then
-    err "[$idx/$total] ERROR    $rel  (failed to hash local file)"
-    ((errors++)) || true
-    continue
-  fi
+  # Print something immediately, before hashing large files.
+  log "[$idx/$total] START    $rel"
 
   # Remote exists?
   if ! ssh "${SSH_OPTS[@]}" "$remote_spec" "test -f $(sq "$remote_file")"; then
@@ -215,13 +291,67 @@ while IFS= read -r -d '' src_file; do
     continue
   fi
 
-  # Remote hash
-  if [[ "$REMOTE_HASH_TOOL" == "sha256sum" ]]; then
-    remote_out="$(ssh "${SSH_OPTS[@]}" "$remote_spec" "sha256sum -- $(sq "$remote_file")" 2>/dev/null || true)"
-  else
-    remote_out="$(ssh "${SSH_OPTS[@]}" "$remote_spec" "shasum -a 256 $(sq "$remote_file")" 2>/dev/null || true)"
+  if [[ "$compare_mode" == "size" || "$compare_mode" == "sample" ]]; then
+    lbytes="$(local_size_bytes "$src_file")"
+    rbytes="$(remote_size_bytes "$remote_file")"
+    if [[ -z "$lbytes" || -z "$rbytes" ]]; then
+      err "[$idx/$total] ERROR    $rel  (failed to read size)"
+      ((errors++)) || true
+      continue
+    fi
+
+    if [[ "$lbytes" != "$rbytes" ]]; then
+      log "[$idx/$total] MISMATCH $rel  (size local=$lbytes remote=$rbytes)"
+      ((mismatched++)) || true
+      continue
+    fi
+
+    if [[ "$compare_mode" == "size" ]]; then
+      log "[$idx/$total] MATCH    $rel  (size=$lbytes)"
+      ((matched++)) || true
+      continue
+    fi
   fi
-  remote_hash="${remote_out%% *}"
+
+  if [[ "$compare_mode" == "sample" ]]; then
+    # Same size already checked above.
+    local_hash="$(local_sample_hash "$src_file" "$lbytes" "$sample_mib" || true)"
+    remote_hash="$(remote_sample_hash "$remote_file" "$rbytes" "$sample_mib" || true)"
+    if [[ -z "$local_hash" || -z "$remote_hash" ]]; then
+      err "[$idx/$total] ERROR    $rel  (failed to compute sample hash)"
+      ((errors++)) || true
+      continue
+    fi
+
+    if [[ "$local_hash" == "$remote_hash" ]]; then
+      log "[$idx/$total] MATCH    $rel  (sample-hash)"
+      ((matched++)) || true
+    else
+      log "[$idx/$total] MISMATCH $rel  (sample-hash)"
+      log "           local : $local_hash"
+      log "           remote: $remote_hash"
+      ((mismatched++)) || true
+    fi
+    continue
+  fi
+
+  # Full SHA-256 (reads entire file on both sides)
+  if [[ "$LOCAL_HASH_TOOL" == "sha256sum" ]]; then
+    local_hash="$(sha256sum -- "$src_file" 2>/dev/null | awk '{print $1}' || true)"
+  else
+    local_hash="$(shasum -a 256 "$src_file" 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  if [[ -z "$local_hash" ]]; then
+    err "[$idx/$total] ERROR    $rel  (failed to hash local file)"
+    ((errors++)) || true
+    continue
+  fi
+
+  if [[ "$REMOTE_HASH_TOOL" == "sha256sum" ]]; then
+    remote_hash="$(ssh "${SSH_OPTS[@]}" "$remote_spec" "sha256sum -- $(sq "$remote_file") 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)"
+  else
+    remote_hash="$(ssh "${SSH_OPTS[@]}" "$remote_spec" "shasum -a 256 $(sq "$remote_file") 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)"
+  fi
   if [[ -z "$remote_hash" ]]; then
     err "[$idx/$total] ERROR    $rel  (failed to hash remote file: $remote_file)"
     ((errors++)) || true
