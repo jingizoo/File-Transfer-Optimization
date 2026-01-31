@@ -10,6 +10,12 @@
 # - Requires passwordless SSH (or SSH agent) for non-interactive operation.
 # - Remote host must have either `sha256sum` or `shasum` available.
 #
+#
+# If you accidentally run this via `sh script.sh`, re-exec under bash (needed for process substitution).
+if [[ -z "${BASH_VERSION:-}" ]]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 usage() {
