@@ -11,8 +11,9 @@
 # - Remote host must have either `sha256sum` or `shasum` available.
 #
 #
-# If you accidentally run this via `sh script.sh`, re-exec under bash (needed for process substitution).
-if [[ -z "${BASH_VERSION:-}" ]]; then
+# If you accidentally run this via `sh script.sh`, re-exec under bash.
+# (Use POSIX [ ] so this works even when started under /bin/sh.)
+if [ -z "${BASH_VERSION:-}" ]; then
   exec bash "$0" "$@"
 fi
 
@@ -156,6 +157,13 @@ echo "  source:  $src_dir"
 echo "  target:  $remote_spec:$remote_root"
 echo
 
+tmp_list="$(mktemp -t compare_sha256.XXXXXX)"
+cleanup() { rm -f "$tmp_list"; }
+trap cleanup EXIT
+
+# Avoid bash process substitution (`done < <(...)`) because it fails in some shells/environments.
+find "$src_dir" -type f -print0 >"$tmp_list"
+
 while IFS= read -r -d '' src_file; do
   rel="${src_file#"$src_dir"/}"
   remote_file="$remote_root/$rel"
@@ -202,7 +210,7 @@ while IFS= read -r -d '' src_file; do
     echo "  remote: $remote_hash"
     ((mismatched++)) || true
   fi
-done < <(find "$src_dir" -type f -print0)
+done <"$tmp_list"
 
 echo
 echo "Summary:"
