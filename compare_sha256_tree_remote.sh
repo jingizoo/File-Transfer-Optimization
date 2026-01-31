@@ -28,6 +28,10 @@ Usage:
 
 Example:
   ./compare_sha256_tree_remote.sh /data/src user@10.0.0.15:/data/dst
+
+Logging:
+  # Log to a file (in addition to stdout)
+  COMPARE_LOG_FILE=compare.log ./compare_sha256_tree_remote.sh /data/src user@host:/data/dst
 EOF
 }
 
@@ -152,10 +156,30 @@ mismatched=0
 missing=0
 errors=0
 
-echo "Comparing SHA-256"
-echo "  source:  $src_dir"
-echo "  target:  $remote_spec:$remote_root"
-echo
+log_file="${COMPARE_LOG_FILE:-}"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log() {
+  if [[ -n "$log_file" ]]; then
+    printf '%s %s\n' "$(ts)" "$*" | tee -a "$log_file"
+  else
+    printf '%s %s\n' "$(ts)" "$*"
+  fi
+}
+err() {
+  if [[ -n "$log_file" ]]; then
+    printf '%s %s\n' "$(ts)" "$*" | tee -a "$log_file" >&2
+  else
+    printf '%s %s\n' "$(ts)" "$*" >&2
+  fi
+}
+
+log "Comparing SHA-256"
+log "  source:  $src_dir"
+log "  target:  $remote_spec:$remote_root"
+if [[ -n "$log_file" ]]; then
+  log "  log:     $log_file"
+fi
+log ""
 
 tmp_list="$(mktemp -t compare_sha256.XXXXXX)"
 cleanup() { rm -f "$tmp_list"; }
@@ -163,8 +187,11 @@ trap cleanup EXIT
 
 # Avoid bash process substitution (`done < <(...)`) because it fails in some shells/environments.
 find "$src_dir" -type f -print0 >"$tmp_list"
+total="$(tr -cd '\0' <"$tmp_list" | wc -c | tr -d '[:space:]')"
+idx=0
 
 while IFS= read -r -d '' src_file; do
+  ((idx++)) || true
   rel="${src_file#"$src_dir"/}"
   remote_file="$remote_root/$rel"
 
@@ -176,14 +203,14 @@ while IFS= read -r -d '' src_file; do
   fi
   local_hash="${local_out%% *}"
   if [[ -z "$local_hash" ]]; then
-    echo "ERROR  $rel  (failed to hash local file)" >&2
+    err "[$idx/$total] ERROR    $rel  (failed to hash local file)"
     ((errors++)) || true
     continue
   fi
 
   # Remote exists?
   if ! ssh "${SSH_OPTS[@]}" "$remote_spec" "test -f $(sq "$remote_file")"; then
-    echo "MISSING $rel"
+    log "[$idx/$total] MISSING  $rel"
     ((missing++)) || true
     continue
   fi
@@ -196,28 +223,28 @@ while IFS= read -r -d '' src_file; do
   fi
   remote_hash="${remote_out%% *}"
   if [[ -z "$remote_hash" ]]; then
-    echo "ERROR  $rel  (failed to hash remote file: $remote_file)" >&2
+    err "[$idx/$total] ERROR    $rel  (failed to hash remote file: $remote_file)"
     ((errors++)) || true
     continue
   fi
 
   if [[ "$local_hash" == "$remote_hash" ]]; then
-    echo "MATCH   $rel"
+    log "[$idx/$total] MATCH    $rel"
     ((matched++)) || true
   else
-    echo "MISMATCH $rel"
-    echo "  local : $local_hash"
-    echo "  remote: $remote_hash"
+    log "[$idx/$total] MISMATCH $rel"
+    log "           local : $local_hash"
+    log "           remote: $remote_hash"
     ((mismatched++)) || true
   fi
 done <"$tmp_list"
 
-echo
-echo "Summary:"
-echo "  matched   : $matched"
-echo "  mismatched: $mismatched"
-echo "  missing   : $missing"
-echo "  errors    : $errors"
+log ""
+log "Summary:"
+log "  matched   : $matched"
+log "  mismatched: $mismatched"
+log "  missing   : $missing"
+log "  errors    : $errors"
 
 if (( mismatched > 0 || missing > 0 || errors > 0 )); then
   exit 1
