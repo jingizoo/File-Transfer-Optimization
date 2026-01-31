@@ -59,3 +59,15 @@ fast-xfer /path/to/20gb_file.txt user@host:/dest/ \
 - File is small (< 1GB)
 - Single CPU core
 - Very slow network (< 10 Mbps)
+
+./fast_xfer.py \
+  /opt/oracle/backup/cp84s03c/cptub05p/rman/pbck_*.dbf \
+  ora9dba@10.197.126.30:/opt/app/oracle/backup/rman_202601291025133/ \
+  --strategy chunked \
+  --parallel 20 \
+  --chunk-size 4G \
+  --workdir /opt/grid/tmp \
+  --cleanup-workdir \
+  --cleanup-delay-seconds 0 \
+  --rsync-timeout 120 \
+  --rsync-operation-timeout 600
