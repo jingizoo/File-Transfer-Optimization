@@ -480,6 +480,17 @@ def remote_mkdir_p(user: str, host: str, connect_timeout: int, cipher: Optional[
     run_checked(cmd)
 
 
+def remote_path_writable(user: str, host: str, connect_timeout: int, cipher: Optional[str], control_path: Optional[str], path: str) -> bool:
+    """Test if a remote path exists and is writable, or can be created."""
+    path_q = shlex.quote(path)
+    # Test: try to create the directory, then test if it's writable, then clean up
+    # This handles both existing and non-existing paths
+    test_cmd = f"mkdir -p {path_q} 2>/dev/null && test -w {path_q} 2>/dev/null"
+    cmd = ssh_base_args(connect_timeout, cipher, control_path) + [f"{user}@{host}", test_cmd]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    return result
+
+
 def compress_file_python_zstd(src: Path, dst: Path, level: int, threads: int = 0) -> None:
     """Compress file using Python zstandard library."""
     if not HAS_ZSTD_LIB:
@@ -2178,12 +2189,18 @@ def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[st
             parts_to_send = compress_parts(parts, compressor, args.compression_level, args.parallel, keep_parts=args.keep_local_parts, compression_threads=getattr(args, 'compression_threads', None))
 
         # Determine staging directory: for NFS destinations, stage on local disk for faster assembly
-        # If --workdir is specified and --remote-stage-base is not, use workdir for remote staging too
+        # If --workdir is specified and --remote-stage-base is not, try to use workdir for remote staging too
         stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
         if not stage_base and args.workdir and not is_local:
-            # Use workdir as remote staging base if not explicitly overridden
-            stage_base = str(Path(args.workdir).resolve())
-            eprint(f"[chunked] Using --workdir {stage_base} as remote staging directory")
+            # Try to use workdir as remote staging base if not explicitly overridden
+            proposed_stage_base = str(Path(args.workdir).resolve())
+            # Test if the path is writable on remote
+            if remote_path_writable(user, host, args.connect_timeout, cipher, control_path, proposed_stage_base):
+                stage_base = proposed_stage_base
+                eprint(f"[chunked] Using --workdir {stage_base} as remote staging directory")
+            else:
+                eprint(f"[chunked] WARNING: --workdir {proposed_stage_base} is not writable on remote, will use default staging location")
+                stage_base = ""  # Will fall through to default logic below
         
         if not stage_base:
             if is_local:
@@ -2526,6 +2543,51 @@ rmdir {stage_q} || true
         else:
             run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", assemble_cmd])
 
+        # Immediate cleanup of local parts after successful assembly (prevent temp space issues)
+        cleanup_delay = getattr(args, 'cleanup_delay_seconds', 0)
+        if cleanup_delay > 0:
+            eprint(f"[chunked] Waiting {cleanup_delay} seconds before cleanup...")
+            time.sleep(cleanup_delay)
+        
+        # Clean up local parts immediately after transfer (unless explicitly asked to keep)
+        if not args.keep_local_parts:
+            eprint(f"[chunked] Cleaning up local parts immediately after transfer...")
+            for p in parts_to_send:
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+            # Also clean up the tmpdir contents
+            try:
+                for child in tmpdir.glob("*"):
+                    try:
+                        if child.is_file():
+                            child.unlink()
+                        elif child.is_dir():
+                            for subchild in child.rglob("*"):
+                                try:
+                                    if subchild.is_file():
+                                        subchild.unlink()
+                                    elif subchild.is_dir():
+                                        subchild.rmdir()
+                                except Exception:
+                                    pass
+                            child.rmdir()
+                    except Exception:
+                        pass
+            except Exception as e:
+                eprint(f"[chunked] Warning: Could not clean up some local parts: {e}")
+        
+        # Explicitly clean up remote staging directory after assembly
+        if not is_local and stage_dir:
+            eprint(f"[chunked] Cleaning up remote staging directory {stage_dir}...")
+            try:
+                remote_cleanup_cmd = f"rm -rf {shlex.quote(stage_dir)} 2>/dev/null || true"
+                run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cleanup_cmd])
+                eprint(f"[chunked] Remote staging directory cleaned up")
+            except Exception as e:
+                eprint(f"[chunked] Warning: Could not clean up remote staging directory {stage_dir}: {e}")
+
         if args.cleanup_local_parts:
             for p in parts_to_send:
                 try:
@@ -2540,34 +2602,45 @@ rmdir {stage_q} || true
                 pass
     finally:
         # Always attempt cleanup, even on failure, to prevent disk space issues
+        # This runs if the earlier cleanup didn't happen (e.g., on error)
         if tmpdir and tmpdir.exists():
-            if cleanup_tmpdir or not args.workdir:
-                # Clean up if explicitly requested, or if using system temp (always cleanup system temp)
-                try:
-                    for child in tmpdir.glob("*"):
-                        try:
-                            if child.is_file():
-                                child.unlink()
-                            elif child.is_dir():
-                                # Try to remove directory contents first
-                                for subchild in child.rglob("*"):
-                                    try:
-                                        if subchild.is_file():
-                                            subchild.unlink()
-                                        elif subchild.is_dir():
-                                            subchild.rmdir()
-                                    except Exception:
-                                        pass
-                                child.rmdir()
-                        except Exception:
-                            pass
-                    tmpdir.rmdir()
-                    eprint(f"[chunked] Cleaned up temporary directory: {tmpdir}")
-                except Exception as e:
-                    eprint(f"[chunked] Warning: Could not fully clean up {tmpdir}: {e}")
+            # Check if directory still has files (cleanup might have already happened)
+            remaining_files = list(tmpdir.glob("*"))
+            if remaining_files:
+                # Still has files, clean up now
+                if cleanup_tmpdir or not args.workdir or (not args.keep_local_parts):
+                    # Clean up if explicitly requested, or if using system temp, or if not keeping parts
+                    try:
+                        for child in tmpdir.glob("*"):
+                            try:
+                                if child.is_file():
+                                    child.unlink()
+                                elif child.is_dir():
+                                    # Try to remove directory contents first
+                                    for subchild in child.rglob("*"):
+                                        try:
+                                            if subchild.is_file():
+                                                subchild.unlink()
+                                            elif subchild.is_dir():
+                                                subchild.rmdir()
+                                        except Exception:
+                                            pass
+                                    child.rmdir()
+                            except Exception:
+                                pass
+                        tmpdir.rmdir()
+                        eprint(f"[chunked] Cleaned up temporary directory: {tmpdir}")
+                    except Exception as e:
+                        eprint(f"[chunked] Warning: Could not fully clean up {tmpdir}: {e}")
+                elif args.workdir and not cleanup_tmpdir:
+                    # Using workdir without --cleanup-workdir: just log it for manual cleanup
+                    eprint(f"[chunked] Temporary directory left at: {tmpdir} (use --cleanup-workdir to auto-cleanup)")
             else:
-                # Using workdir without --cleanup-workdir: just log it for manual cleanup
-                eprint(f"[chunked] Temporary directory left at: {tmpdir} (use --cleanup-workdir to auto-cleanup)")
+                # Directory is already empty, just remove it
+                try:
+                    tmpdir.rmdir()
+                except Exception:
+                    pass
 
 
 def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str],
@@ -2654,10 +2727,16 @@ def strategy_turbo(args: argparse.Namespace, is_local: bool, user: Optional[str]
     # Remote staging directory: if destination filesystem is NFS, stage on /var/tmp (local disk) by default.
     dest_fs = remote_fs_type(user, host, args.connect_timeout, cipher, control_path, dest_dir)
     stage_base = (getattr(args, "remote_stage_base", "") or "").strip()
-    # If --workdir is specified and --remote-stage-base is not, use workdir for remote staging too
+    # If --workdir is specified and --remote-stage-base is not, try to use workdir for remote staging too
     if not stage_base and args.workdir:
-        stage_base = str(Path(args.workdir).resolve())
-        eprint(f"[turbo] Using --workdir {stage_base} as remote staging directory")
+        proposed_stage_base = str(Path(args.workdir).resolve())
+        # Test if the path is writable on remote
+        if remote_path_writable(user, host, args.connect_timeout, cipher, control_path, proposed_stage_base):
+            stage_base = proposed_stage_base
+            eprint(f"[turbo] Using --workdir {stage_base} as remote staging directory")
+        else:
+            eprint(f"[turbo] WARNING: --workdir {proposed_stage_base} is not writable on remote, will use default staging location")
+            stage_base = ""  # Will fall through to default logic below
     
     if not stage_base:
         if "nfs" in dest_fs.lower():
@@ -2927,6 +3006,22 @@ cd /
 rmdir {stage_q} 2>/dev/null || true
 """
     run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cmd])
+
+    # Immediate cleanup after successful transfer (prevent temp space issues)
+    cleanup_delay = getattr(args, 'cleanup_delay_seconds', 0)
+    if cleanup_delay > 0:
+        eprint(f"[turbo] Waiting {cleanup_delay} seconds before cleanup...")
+        time.sleep(cleanup_delay)
+    
+    # Explicitly clean up remote staging directory after assembly
+    if stage_dir:
+        eprint(f"[turbo] Cleaning up remote staging directory {stage_dir}...")
+        try:
+            remote_cleanup_cmd = f"rm -rf {shlex.quote(stage_dir)} 2>/dev/null || true"
+            run_checked(ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", remote_cleanup_cmd])
+            eprint(f"[turbo] Remote staging directory cleaned up")
+        except Exception as e:
+            eprint(f"[turbo] Warning: Could not clean up remote staging directory {stage_dir}: {e}")
 
     # Cleanup local tempdir
     if cleanup_tmpdir and not getattr(args, "keep_local_artifact", False):
@@ -3205,6 +3300,7 @@ def main() -> int:
     p.add_argument("--workdir", default=None, help="Working directory for artifacts/parts (default: alongside source, or temp for chunked)")
     p.add_argument("--cleanup-workdir", action="store_true", help="If --workdir is used with chunked, remove temp subdir after success")
     p.add_argument("--cleanup-max-age-hours", type=int, default=24, help="Auto-cleanup temp directories older than this many hours in --workdir (default: 24, set to 0 to disable)")
+    p.add_argument("--cleanup-delay-seconds", type=int, default=0, help="Delay in seconds before cleaning up temp files after transfer (default: 0 = immediate, useful for debugging or if files are still in use)")
     p.add_argument("--compressor", choices=["zstd", "pigz", "gzip"], default="pigz", help="Compression algorithm (pigz=fast parallel gzip, zstd=better ratio, gzip=fallback)")
     p.add_argument("--compression-level", type=int, default=6, help="Compression level (1=fast, 6=default for pigz/gzip, 3=default for zstd)")
     p.add_argument("--compression-threads", type=int, default=0, help="Threads for compression (0=auto, pigz only)")
