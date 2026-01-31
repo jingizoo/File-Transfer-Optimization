@@ -19,6 +19,9 @@ fi
 
 set -euo pipefail
 
+# Helpful fatal error message if something unexpected triggers `set -e`.
+trap 'err "FATAL: line=$LINENO cmd=$BASH_COMMAND (exit=$?)"' ERR
+
 usage() {
   cat <<'EOF'
 Compare SHA-256 hashes for a local directory vs a remote directory.
@@ -100,7 +103,11 @@ else
   exit 2
 fi
 
+# Important: when running `ssh` inside a loop reading from stdin, ssh can consume stdin and
+# prematurely end the loop. `-n` prevents ssh from reading stdin; `-T` disables TTY allocation.
 SSH_OPTS=(
+  -n
+  -T
   -o ConnectTimeout=10
 )
 
@@ -286,21 +293,36 @@ esac
 
 if [[ "$list_mode" == "print0" ]]; then
   find "$src_dir" -type f -print0 >"$tmp_list"
-  total="$(tr -cd '\0' <"$tmp_list" | wc -c | tr -d '[:space:]')"
 else
   find "$src_dir" -type f -print >"$tmp_list"
-  total="$(wc -l <"$tmp_list" | tr -d '[:space:]')"
 fi
-idx=0
 
-while :; do
+# Prefer array-based iteration when available (more reliable in some environments).
+use_array=0
+if builtin type mapfile >/dev/null 2>&1; then
+  use_array=1
+fi
+
+idx=0
+total=0
+
+if (( use_array == 1 )); then
   if [[ "$list_mode" == "print0" ]]; then
-    IFS= read -r -d '' src_file || break
+    mapfile -d '' -t __files <"$tmp_list"
   else
-    IFS= read -r src_file || break
-    [[ -n "$src_file" ]] || continue
+    mapfile -t __files <"$tmp_list"
   fi
-  ((idx++)) || true
+  total="${#__files[@]}"
+else
+  if [[ "$list_mode" == "print0" ]]; then
+    total="$(tr -cd '\0' <"$tmp_list" | wc -c | tr -d '[:space:]')"
+  else
+    total="$(wc -l <"$tmp_list" | tr -d '[:space:]')"
+  fi
+fi
+
+process_one() {
+  local src_file="$1"
   rel="${src_file#"$src_dir"/}"
   remote_file="$remote_root/$rel"
 
@@ -390,7 +412,26 @@ while :; do
     log "           remote: $remote_hash"
     ((mismatched++)) || true
   fi
-done <"$tmp_list"
+}
+
+if (( use_array == 1 )); then
+  for src_file in "${__files[@]}"; do
+    [[ -n "$src_file" ]] || continue
+    ((idx++)) || true
+    process_one "$src_file"
+  done
+else
+  while :; do
+    if [[ "$list_mode" == "print0" ]]; then
+      IFS= read -r -d '' src_file || break
+    else
+      IFS= read -r src_file || break
+      [[ -n "$src_file" ]] || continue
+    fi
+    ((idx++)) || true
+    process_one "$src_file"
+  done <"$tmp_list"
+fi
 
 log ""
 log "Summary:"
