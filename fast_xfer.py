@@ -75,7 +75,13 @@ def run_checked(cmd: List[str], *, capture: bool = False, env: Optional[Dict[str
     return ""
 
 
-def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> None:
+def run_stream(
+    cmd: List[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    timeout: Optional[int] = None,
+    allow_rsync_exit_23: bool = False,
+) -> None:
     """
     Run a command and stream combined stdout/stderr to our stdout.
     If timeout is set and the command hangs, it will be killed and raise RuntimeError.
@@ -165,6 +171,9 @@ def run_stream(cmd: List[str], *, env: Optional[Dict[str, str]] = None, timeout:
                 "        - Destination filesystem does not support some attributes (ACLs/xattrs)\n"
                 "      Scroll up to see the specific 'rsync:' ERROR/WARNING lines above."
             )
+            if allow_rsync_exit_23:
+                eprint("[dir] NOTE: --allow-rsync-exit-23 enabled; continuing despite rsync exit 23.")
+                return
         elif enospc_detected or (base_cmd == "rsync" and any("no space" in line.lower() or "enospc" in line.lower() for line in output_lines)):
             eprint(
                 "\n[ERROR] DESTINATION OUT OF SPACE - This is why rsync hung!\n"
@@ -195,6 +204,7 @@ def run_rsync_with_retry(
     is_local: bool = False,
     src: Optional[str] = None,
     dest: Optional[str] = None,
+    allow_rsync_exit_23: bool = False,
 ) -> None:
     """
     Run rsync with retry logic and timeout protection.
@@ -223,7 +233,7 @@ def run_rsync_with_retry(
             eprint(f"        - File permissions (access denied)")
             eprint(f"        - Domain authentication (CIFS/domain mounts - slower)")
             
-            run_stream(cmd, env=env, timeout=timeout)
+            run_stream(cmd, env=env, timeout=timeout, allow_rsync_exit_23=allow_rsync_exit_23)
             return  # Success
         except RuntimeError as e:
             last_error = e
@@ -1105,6 +1115,7 @@ def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str
             is_local=is_local,
             src=str(src),
             dest=dest_file,
+            allow_rsync_exit_23=getattr(args, "allow_rsync_exit_23", False),
         )
 
 
@@ -1241,6 +1252,7 @@ def strategy_dir_rsync(
             is_local=is_local,
             src=src_arg,
             dest=dest_root,
+            allow_rsync_exit_23=getattr(args, "allow_rsync_exit_23", False),
         )
     finally:
         # Cleanup temporary files-from list, if any
@@ -1583,6 +1595,7 @@ def strategy_compress(args: argparse.Namespace, is_local: bool, user: Optional[s
             is_local=is_local,
             src=str(comp_local),
             dest=comp_dest,
+            allow_rsync_exit_23=getattr(args, "allow_rsync_exit_23", False),
         )
         transfer_elapsed = time.time() - transfer_start
         transfer_speed = comp_size / transfer_elapsed if transfer_elapsed > 0 else 0
@@ -3435,6 +3448,14 @@ def main() -> int:
     p.add_argument("--temp-dir", default=None, help="Temporary directory for SSH control sockets (default: system temp, respects TMPDIR env var)")
     p.add_argument("--rsync-compress", action="store_true", help="Use rsync's built-in compression (compresses on-the-fly during transfer, more efficient than pre-compression)")
     p.add_argument("--rsync-compress-level", type=int, default=1, help="rsync compression level (1=fast, 6=better ratio, default: 1)")
+    p.add_argument(
+        "--allow-rsync-exit-23",
+        "--skip-permission-denied",
+        action="store_true",
+        dest="allow_rsync_exit_23",
+        help="Do not fail the run if rsync returns exit code 23 (e.g., permission denied on some files/attrs). "
+             "Rsync will still print which files were skipped; treat the result as a partial copy.",
+    )
     p.add_argument(
         "--before-date",
         default=None,
