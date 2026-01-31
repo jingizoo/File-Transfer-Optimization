@@ -58,6 +58,7 @@ def eprint(*args: object, **kwargs) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
 RSYNC_SKIPPED_LOG: List[str] = []
+RSYNC_LAST_SKIPPED: Optional[str] = None
 
 
 def _rsync_line_looks_skipped(line: str) -> bool:
@@ -82,6 +83,18 @@ def _append_rsync_skipped(line: str) -> None:
     s = (line or "").rstrip("\n")
     if s and _rsync_line_looks_skipped(s):
         RSYNC_SKIPPED_LOG.append(s)
+        global RSYNC_LAST_SKIPPED
+        RSYNC_LAST_SKIPPED = s
+
+
+def _append_rsync_skip_note(note: str) -> None:
+    """Add a synthetic skip note (e.g., timeout) to the skipped log."""
+    s = (note or "").strip()
+    if not s:
+        return
+    RSYNC_SKIPPED_LOG.append(s)
+    global RSYNC_LAST_SKIPPED
+    RSYNC_LAST_SKIPPED = s
 
 
 def which(cmd: str) -> Optional[str]:
@@ -212,7 +225,7 @@ def run_stream(
                 eprint("[dir] NOTE: --allow-rsync-exit-23 enabled; continuing despite rsync exit 23.")
                 # Add a small marker so the end-of-run log clearly shows where exit 23 happened.
                 tag = ctx or "rsync"
-                RSYNC_SKIPPED_LOG.append(f"[{tag}] rsync exit 23 (partial transfer; see rsync lines above)")
+                _append_rsync_skip_note(f"[{tag}] rsync exit 23 (partial transfer; see rsync lines above)")
                 return
         elif enospc_detected or (base_cmd == "rsync" and any("no space" in line.lower() or "enospc" in line.lower() for line in output_lines)):
             eprint(
@@ -230,6 +243,8 @@ def run_stream(
             )
             raise RuntimeError(f"Destination out of space (ENOSPC): {fmt_cmd(cmd)}")
         elif timeout and timeout > 0 and rc == -9:  # SIGKILL
+            tag = ctx or base_cmd or "cmd"
+            _append_rsync_skip_note(f"[{tag}] TIMEOUT after {timeout}s (process killed)")
             raise RuntimeError(f"Command timed out after {timeout}s and was killed: {fmt_cmd(cmd)}")
         raise RuntimeError(f"Command failed (exit={rc}): {fmt_cmd(cmd)}")
 
@@ -286,6 +301,7 @@ def run_rsync_with_retry(
                 eprint(f"            - Scanning directories (use --no-inc-recursive)")
                 eprint(f"            - Reading file metadata (NAS is slow to respond)")
                 eprint(f"            - Network connection (check NAS mount health)")
+                _append_rsync_skip_note(f"[{ctx}] TIMEOUT/HANG: {error_msg}")
             elif "exit=23" in error_msg or "exit code 23" in error_msg:
                 # Exit 23 is usually non-fatal (some files not transferred), but we'll retry once
                 if attempt < max_retries:
@@ -3819,6 +3835,8 @@ def _maybe_write_skipped_log(args: argparse.Namespace) -> None:
 
         eprint("\n[rsync] Skipped/permission-denied summary:")
         eprint(f"[rsync] Total skipped/error lines captured: {len(lines)}")
+        if RSYNC_LAST_SKIPPED:
+            eprint(f"[rsync] LAST SKIPPED: {RSYNC_LAST_SKIPPED}")
         # Print a small tail to CLI (full list goes to file)
         tail_n = 25
         if len(lines) <= tail_n:
