@@ -992,6 +992,73 @@ def normalize_dest_path(target_path: str, src_file: Path) -> Tuple[str, str]:
 
 
 def strategy_direct(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, ssh_e: Optional[str]) -> None:
+    src = Path(args.source).resolve()
+    
+    # Check if we should skip already-copied files
+    # For direct strategy, rsync will skip by default if size+mtime match, but we can do checksum verification
+    # Default to False for direct since rsync already handles this (but checksum is more reliable)
+    skip_existing = getattr(args, 'skip_existing', False)  # Default False for direct (rsync handles it)
+    if skip_existing:
+        # Check if destination file already exists
+        dest_exists = False
+        if is_local:
+            dest_path = Path(dest_file)
+            if dest_path.exists() and dest_path.is_file():
+                dest_exists = True
+        else:
+            # Check remote file existence
+            assert user is not None and host is not None
+            check_cmd = f"test -f {shlex.quote(dest_file)} && echo 'exists' || echo 'missing'"
+            # Use basic SSH args for quick check
+            basic_ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+            cmd = basic_ssh + [f"{user}@{host}", check_cmd]
+            try:
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10)
+                if result.returncode == 0 and "exists" in result.stdout:
+                    dest_exists = True
+            except Exception:
+                pass  # If check fails, proceed with transfer
+        
+        if dest_exists:
+            # File exists, check if it matches (compare checksums)
+            eprint(f"[direct] Destination file exists, checking if it matches source...")
+            try:
+                src_hash = sha256sum_local(src)
+                if is_local:
+                    dest_hash = sha256sum_local_path(dest_file)
+                else:
+                    assert user is not None and host is not None
+                    # Need cipher and control_path for remote checksum
+                    cipher = getattr(args, 'cipher', None)
+                    control_path = getattr(args, 'control_path', None)
+                    connect_timeout = getattr(args, 'connect_timeout', 10)
+                    if cipher and control_path:
+                        dest_hash = sha256sum_remote(user, host, connect_timeout, cipher, control_path, dest_file)
+                    else:
+                        # Fallback: just check size
+                        src_size = src.stat().st_size
+                        size_cmd = f"stat -c %s {shlex.quote(dest_file)} 2>/dev/null || echo '0'"
+                        cmd = basic_ssh + [f"{user}@{host}", size_cmd]
+                        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10)
+                        if result.returncode == 0:
+                            try:
+                                dest_size = int(result.stdout.strip())
+                                if src_size == dest_size:
+                                    eprint(f"[direct] ✓ File already exists with matching size ({human_bytes(src_size)}), skipping transfer")
+                                    return
+                            except ValueError:
+                                pass
+                        eprint(f"[direct] Could not verify existing file, will re-transfer")
+                        dest_hash = None
+                
+                if dest_hash and src_hash == dest_hash:
+                    eprint(f"[direct] ✓ File already exists and matches source (sha256: {src_hash[:16]}...), skipping transfer")
+                    return  # Skip transfer
+                else:
+                    eprint(f"[direct] File exists but checksums differ, will re-transfer")
+            except Exception as e:
+                eprint(f"[direct] Could not verify existing file ({e}), will re-transfer")
+    
     if is_local:
         # For local transfers, ALWAYS use direct copy (faster than rsync)
         src = Path(args.source).resolve()
@@ -2082,6 +2149,52 @@ def cleanup_old_temp_dirs(workdir: Path, max_age_hours: int = 24, pattern: str =
 
 def strategy_chunked(args: argparse.Namespace, is_local: bool, user: Optional[str], host: Optional[str], dest_file: str, dest_dir: str, ssh_e: Optional[str], control_path: Optional[str], cipher: Optional[str]) -> None:
     src = Path(args.source).resolve()
+    
+    # Check if we should skip already-copied files
+    # For chunked strategy, we should check the final file (not chunks) before starting
+    # Default to True for chunked since chunks are always new temp files, but final file might already exist
+    # Note: --no-skip-existing can override this default
+    skip_existing = getattr(args, 'skip_existing', True)  # Default True for chunked strategy
+    if getattr(args, 'no_skip_existing', False):
+        skip_existing = False  # Override if --no-skip-existing is set
+    if skip_existing:
+        # Check if destination file already exists
+        dest_exists = False
+        if is_local:
+            dest_path = Path(dest_file)
+            if dest_path.exists() and dest_path.is_file():
+                dest_exists = True
+        else:
+            # Check remote file existence
+            assert user is not None and host is not None and cipher is not None
+            check_cmd = f"test -f {shlex.quote(dest_file)} && echo 'exists' || echo 'missing'"
+            cmd = ssh_base_args(args.connect_timeout, cipher, control_path) + [f"{user}@{host}", check_cmd]
+            try:
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10)
+                if result.returncode == 0 and "exists" in result.stdout:
+                    dest_exists = True
+            except Exception:
+                pass  # If check fails, proceed with transfer
+        
+        if dest_exists:
+            # File exists, check if it matches (compare checksums)
+            eprint(f"[chunked] Destination file exists, checking if it matches source...")
+            try:
+                src_hash = sha256sum_local(src)
+                if is_local:
+                    dest_hash = sha256sum_local_path(dest_file)
+                else:
+                    assert user is not None and host is not None and cipher is not None
+                    dest_hash = sha256sum_remote(user, host, args.connect_timeout, cipher, control_path, dest_file)
+                
+                if src_hash == dest_hash:
+                    eprint(f"[chunked] ✓ File already exists and matches source (sha256: {src_hash[:16]}...), skipping transfer")
+                    return  # Skip transfer
+                else:
+                    eprint(f"[chunked] File exists but checksums differ, will re-transfer")
+            except Exception as e:
+                eprint(f"[chunked] Could not verify existing file ({e}), will re-transfer")
+    
     tmpdir: Optional[Path] = None
     cleanup_tmpdir = False
     
@@ -3334,6 +3447,8 @@ def main() -> int:
     )
     p.add_argument("--verify-sha256", action="store_true", help="Compute sha256 on source+target after transfer (slow for huge files)")
     p.add_argument("--skip-space-check", action="store_true", help="Skip pre-flight space check on destination (not recommended - can cause hangs if out of space)")
+    p.add_argument("--skip-existing", action="store_true", help="Skip files that already exist on destination with matching checksum (default: enabled for chunked, disabled for direct). More reliable than rsync's default size+mtime check")
+    p.add_argument("--no-skip-existing", action="store_true", dest="no_skip_existing", help="Disable skip-existing check (force re-transfer even if file exists and matches)")
     p.add_argument("--remove-source", action="store_true", help="Delete source file(s) after successful transfer (move operation - use with caution)")
 
     args = p.parse_args()

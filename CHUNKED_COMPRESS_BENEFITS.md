@@ -68,6 +68,5 @@ fast-xfer /path/to/20gb_file.txt user@host:/dest/ \
   --chunk-size 4G \
   --workdir /opt/grid/tmp \
   --cleanup-workdir \
-  --cleanup-delay-seconds 0 \
-  --rsync-timeout 120 \
-  --rsync-operation-timeout 600
+  --skip-existing \
+  --verify-sha256
