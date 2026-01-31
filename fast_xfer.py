@@ -57,6 +57,32 @@ except ImportError:
 def eprint(*args: object, **kwargs) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
+RSYNC_SKIPPED_LOG: List[str] = []
+
+
+def _rsync_line_looks_skipped(line: str) -> bool:
+    """
+    Heuristic: capture rsync lines that indicate some files were skipped or could not be read/set attrs.
+    (Most commonly permission issues that produce rsync exit code 23.)
+    """
+    s = (line or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    # Common skip/error patterns (keep reasonably tight to avoid logging progress noise)
+    if low.startswith("rsync:"):
+        if any(k in low for k in ["permission denied", "operation not permitted", "failed", "vanished", "error", "mkstemp", "chmod", "chown", "setxattr", "lsetxattr", "recv_generator"]):
+            return True
+    if any(k in low for k in ["permission denied", "operation not permitted"]):
+        return True
+    return False
+
+
+def _append_rsync_skipped(line: str) -> None:
+    s = (line or "").rstrip("\n")
+    if s and _rsync_line_looks_skipped(s):
+        RSYNC_SKIPPED_LOG.append(s)
+
 
 def which(cmd: str) -> Optional[str]:
     return shutil.which(cmd)
@@ -81,6 +107,7 @@ def run_stream(
     env: Optional[Dict[str, str]] = None,
     timeout: Optional[int] = None,
     allow_rsync_exit_23: bool = False,
+    ctx: Optional[str] = None,
 ) -> None:
     """
     Run a command and stream combined stdout/stderr to our stdout.
@@ -113,7 +140,10 @@ def run_stream(
         for line in p.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
+            # Keep bounded history (avoid unbounded memory on huge outputs)
             output_lines.append(line)
+            if len(output_lines) > 5000:
+                output_lines = output_lines[-2000:]
             # Detect out-of-space errors
             line_lower = line.lower()
             if any(phrase in line_lower for phrase in [
@@ -125,6 +155,13 @@ def run_stream(
                 "out of space",
             ]):
                 enospc_detected = True
+            # Capture per-file skips/permission issues for end-of-run log.
+            base_cmd = os.path.basename(cmd[0]) if cmd else ""
+            if base_cmd == "rsync" and _rsync_line_looks_skipped(line):
+                if ctx:
+                    _append_rsync_skipped(f"[{ctx}] {line.strip()}")
+                else:
+                    _append_rsync_skipped(line.strip())
     except BrokenPipeError:
         # Process was killed
         pass
@@ -173,6 +210,9 @@ def run_stream(
             )
             if allow_rsync_exit_23:
                 eprint("[dir] NOTE: --allow-rsync-exit-23 enabled; continuing despite rsync exit 23.")
+                # Add a small marker so the end-of-run log clearly shows where exit 23 happened.
+                tag = ctx or "rsync"
+                RSYNC_SKIPPED_LOG.append(f"[{tag}] rsync exit 23 (partial transfer; see rsync lines above)")
                 return
         elif enospc_detected or (base_cmd == "rsync" and any("no space" in line.lower() or "enospc" in line.lower() for line in output_lines)):
             eprint(
@@ -233,7 +273,8 @@ def run_rsync_with_retry(
             eprint(f"        - File permissions (access denied)")
             eprint(f"        - Domain authentication (CIFS/domain mounts - slower)")
             
-            run_stream(cmd, env=env, timeout=timeout, allow_rsync_exit_23=allow_rsync_exit_23)
+            ctx = f"{src or '?'} -> {dest or '?'}"
+            run_stream(cmd, env=env, timeout=timeout, allow_rsync_exit_23=allow_rsync_exit_23, ctx=ctx)
             return  # Success
         except RuntimeError as e:
             last_error = e
@@ -3457,6 +3498,12 @@ def main() -> int:
              "Rsync will still print which files were skipped; treat the result as a partial copy.",
     )
     p.add_argument(
+        "--skipped-log-file",
+        default=None,
+        help="Write a summary of rsync skipped/permission-denied items to this file at end of run "
+             "(default: 'skipped_files.log' when --allow-rsync-exit-23 is set).",
+    )
+    p.add_argument(
         "--before-date",
         default=None,
         help="Directory mode ONLY: only transfer files whose modification time is BEFORE this date (YYYY-MM-DD).",
@@ -3721,201 +3768,53 @@ def main() -> int:
             for src, code in failed:
                 eprint(f"  - {src} (exit code: {code})")
             return 1
+        # End-of-run skipped log
+        _maybe_write_skipped_log(args)
         return 0
     else:
         # Single source - process normally
         args.source = sources[0]
-        return process_single_source(args, is_local, user, host, target_path, dest_dir, ssh_e, control_path, cipher)
+        rc = process_single_source(args, is_local, user, host, target_path, dest_dir, ssh_e, control_path, cipher)
+        _maybe_write_skipped_log(args)
+        return rc
 
-    # Detect mount type for source (important for domain mounts)
-    mount_info = None
-    if is_local:
-        mount_info = get_mount_info(str(src))
-        if mount_info:
-            mount_type, mount_server, mount_point = mount_info
-            eprint(f"[mount] Source detected on {mount_type.upper()} mount: {mount_server} -> {mount_point}")
-            if mount_type in ("cifs", "domain"):
-                eprint(f"[mount] Domain/CIFS mount detected - using extended timeouts for authentication")
-                # Adjust timeouts for domain mounts (they're slower due to authentication)
-                if not hasattr(args, 'rsync_timeout') or args.rsync_timeout == 0:
-                    args.rsync_timeout = 120  # Default 120s for domain mounts
-                if not hasattr(args, 'rsync_operation_timeout') or args.rsync_operation_timeout == 300:
-                    args.rsync_operation_timeout = 600  # 10 minutes for domain mounts
-                if not hasattr(args, 'rsync_contimeout'):
-                    args.rsync_contimeout = 60  # 60s connection timeout for domain
-                eprint(f"[mount] Adjusted timeouts: rsync-timeout={args.rsync_timeout}s, operation-timeout={args.rsync_operation_timeout}s")
 
-    # For local transfers, we don't need SSH
-    if is_local:
-        eprint("[local] Detected local path - using direct file operations")
-        local_mkdir_p(dest_dir)
-        ssh_e = None
-        control_path = None
-        cipher = None
-    else:
-        if which("ssh") is None:
-            eprint("ERROR: requires ssh installed for remote transfers.")
-            return 2
-        # Use user-specified temp dir or system default (respects TMPDIR env var)
-        temp_base = args.temp_dir if hasattr(args, 'temp_dir') and args.temp_dir else tempfile.gettempdir()
-        control_path = os.path.join(temp_base, f"sshcm-{os.getpid()}-%r@%h:%p")
-        cipher = pick_ssh_cipher(user, host, args.connect_timeout, control_path)
-        ssh_e = ssh_cmd_str(args.connect_timeout, cipher, control_path)
-        remote_mkdir_p(user, host, args.connect_timeout, cipher, control_path, dest_dir)
-
-    # Pre-flight space check (unless disabled)
-    if not getattr(args, 'skip_space_check', False):
-        eprint("[space-check] Calculating source size...")
-        src_size = calculate_source_size(src)
-        if src_size > 0:
-            eprint(f"[space-check] Source size: {human_bytes(src_size)}")
-            has_space, available, error_msg = check_destination_space(
-                src_size,
-                is_local,
-                dest_dir,
-                user=user,
-                host=host,
-                connect_timeout=args.connect_timeout,
-                cipher=cipher,
-                control_path=control_path,
-            )
-            if available is not None:
-                eprint(f"[space-check] Destination available space: {human_bytes(available)}")
-            if not has_space:
-                eprint(f"[space-check] ERROR: {error_msg}")
-                eprint(f"[space-check] Transfer will likely HANG when destination runs out of space.")
-                eprint(f"[space-check] Solutions:")
-                eprint(f"  - Free up space on destination")
-                eprint(f"  - Delete old files or increase filesystem size")
-                eprint(f"  - Use compression to reduce transfer size: --rsync-compress or --strategy compress")
-                eprint(f"  - Transfer in smaller batches")
-                eprint(f"  - Use --skip-space-check to proceed anyway (NOT RECOMMENDED)")
-                return 1
-        else:
-            eprint("[space-check] Could not calculate source size, skipping space check")
-    else:
-        eprint("[space-check] Skipping space check (--skip-space-check enabled)")
-
-    strategy = args.strategy
-    if strategy == "auto":
-        # Auto rule of thumb:
-        #   1) If both ends have zstd and the file looks compressible -> compress (fastest over constrained links)
-        #   2) Else -> direct rsync
-        # Chunked/parallel is powerful but operationally heavier, so it's opt-in via --strategy chunked.
-        if args.append_only:
-            strategy = "direct"
-        else:
-            # Check if compressor is available
-            compressor = args.compressor
-            comp_info = get_compressor_cmd(compressor)
-            
-            if args.skip_estimate:
-                # Skip estimation, use direct
-                eprint("[auto] Skipping compression estimation (--skip-estimate)")
-                strategy = "direct"
-            elif is_local:
-                # For local, check if compressor is available
-                if comp_info:
-                    eprint(f"[auto] Estimating compression ratio with {compressor}...")
-                    sample_bytes = args.auto_sample_mib * 1024**2
-                    est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes, args.estimate_timeout)
-                    if est:
-                        ratio, in_b, out_b = est
-                        eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
-                        if ratio <= args.auto_threshold:
-                            strategy = "compress"
-                        else:
-                            strategy = "direct"
-                    else:
-                        eprint("[auto] Compression estimation failed or timed out, using direct transfer")
-                        strategy = "direct"
-                else:
-                    strategy = "direct"
-            else:
-                assert user is not None and host is not None and cipher is not None, "user, host, and cipher must be set for remote transfers"
-                if comp_info:
-                    # Check if remote has decompressor
-                    _, decomp_cmd, _ = comp_info
-                    if compressor == "zstd":
-                        remote_cmd_check = "zstd"
-                    elif compressor in ("pigz", "gzip"):
-                        remote_cmd_check = "gunzip" if which("gunzip") else "gzip"
-                    else:
-                        remote_cmd_check = decomp_cmd
-                    
-                    if remote_has_cmd(user, host, args.connect_timeout, cipher, control_path, remote_cmd_check):
-                        eprint(f"[auto] Estimating compression ratio with {compressor}...")
-                        sample_bytes = args.auto_sample_mib * 1024**2
-                        est = estimate_compression_ratio(src, compressor, args.compression_level, sample_bytes, args.estimate_timeout)
-                        if est:
-                            ratio, in_b, out_b = est
-                            eprint(f"[auto] {compressor} sample: in={human_bytes(in_b)} out={human_bytes(out_b)} ratio={ratio:.3f}")
-                            if ratio <= args.auto_threshold:
-                                strategy = "compress"
-                            else:
-                                strategy = "direct"
-                        else:
-                            eprint("[auto] Compression estimation failed or timed out, using direct transfer")
-                            strategy = "direct"
-                    else:
-                        strategy = "direct"
-                else:
-                    strategy = "direct"
-
-    start = time.time()
-    if src.is_dir():
-        # Directory mode: always use rsync-based directory transfer, ignore other strategies.
-        if strategy not in ("direct", "auto"):
-            eprint(f"[dir] WARNING: Source is a directory; ignoring --strategy={strategy!r} and using rsync directory transfer")
-        if is_local:
-            eprint(f"=== Directory transfer (rsync) | src={src}/ -> {target_path} (local) ===")
-        else:
-            eprint(f"=== Directory transfer (rsync) | src={src}/ -> {user}@{host}:{target_path} ===")
-    else:
-        if is_local:
-            eprint(f"=== Strategy: {strategy} | src={src} -> {dest_file} (local) ===")
-        else:
-            eprint(f"=== Strategy: {strategy} | src={src} -> {user}@{host}:{dest_file} ===")
-
+def _maybe_write_skipped_log(args: argparse.Namespace) -> None:
+    """
+    Print a summary of skipped/permission-denied rsync items and optionally write them to a file.
+    This is best-effort and should never fail the main operation.
+    """
     try:
-        if src.is_dir():
-            # Directory tree transfer
-            strategy_dir_rsync(args, is_local, user, host, target_path, ssh_e)
-            if args.verify_sha256:
-                eprint("[dir] NOTE: --verify-sha256 is not implemented for directory transfers; skipping integrity check")
+        if not RSYNC_SKIPPED_LOG:
+            return
+        # Deduplicate while preserving order
+        seen = set()
+        lines: List[str] = []
+        for s in RSYNC_SKIPPED_LOG:
+            if s not in seen:
+                seen.add(s)
+                lines.append(s)
+
+        eprint("\n[rsync] Skipped/permission-denied summary:")
+        eprint(f"[rsync] Total skipped/error lines captured: {len(lines)}")
+        # Print a small tail to CLI (full list goes to file)
+        tail_n = 25
+        if len(lines) <= tail_n:
+            for s in lines:
+                eprint(f"[rsync-skip] {s}")
         else:
-            # Single-file transfer strategies
-            if strategy == "direct":
-                strategy_direct(args, is_local, user, host, dest_file, ssh_e)
-            elif strategy == "compress":
-                strategy_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
-            elif strategy == "stream":
-                strategy_stream_compress(args, is_local, user, host, dest_file, ssh_e, control_path, cipher)
-            elif strategy == "chunked":
-                strategy_chunked(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
-            elif strategy == "turbo":
-                strategy_turbo(args, is_local, user, host, dest_file, dest_dir, ssh_e, control_path, cipher)
-            else:
-                raise RuntimeError(f"Unknown strategy: {strategy}")
+            for s in lines[-tail_n:]:
+                eprint(f"[rsync-skip] {s}")
+            eprint(f"[rsync] (showing last {tail_n}; write full list to file with --skipped-log-file)")
 
-            if args.verify_sha256:
-                eprint("=== Verifying sha256 (this will read the full file on both ends) ===")
-                local_h = sha256sum_local(src)
-                if is_local:
-                    remote_h = sha256sum_local_path(dest_file)
-                else:
-                    remote_h = sha256sum_remote(user, host, args.connect_timeout, cipher, control_path, dest_file)
-                eprint(f"source sha256:  {local_h}")
-                eprint(f"dest sha256:    {remote_h}")
-                if local_h != remote_h:
-                    raise RuntimeError("sha256 mismatch: transfer may be corrupted")
-
-        elapsed = time.time() - start
-        eprint(f"=== Done in {elapsed:.1f}s ===")
-        return 0
-    except Exception as ex:
-        eprint(f"ERROR: {ex}")
-        return 1
+        log_path = getattr(args, "skipped_log_file", None) or ("skipped_files.log" if getattr(args, "allow_rsync_exit_23", False) else None)
+        if log_path:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+                f.write("\n")
+            eprint(f"[rsync] Wrote skipped log: {log_path}")
+    except Exception as e:
+        eprint(f"[rsync] WARNING: failed to write skipped log: {e}")
 
 
 if __name__ == "__main__":
