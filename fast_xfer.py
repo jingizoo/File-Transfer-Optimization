@@ -1231,10 +1231,47 @@ def strategy_dir_rsync(
     extra_rsync_args: List[str] = []
     before_date_str = getattr(args, "before_date", None)
     after_date_str = getattr(args, "after_date", None)
+    include_from_path = getattr(args, "include_from", None)
     if before_date_str and after_date_str:
         raise RuntimeError("Use only ONE of --before-date or --after-date (they are mutually exclusive).")
+    if include_from_path and (before_date_str or after_date_str):
+        raise RuntimeError("Use --include-from OR --before-date/--after-date (they are mutually exclusive).")
 
     files_from_path: Optional[str] = None
+    include_from_count: Optional[int] = None
+
+    if include_from_path:
+        if not os.path.isfile(include_from_path):
+            raise RuntimeError(f"--include-from file not found: {include_from_path}")
+        # Normalize:
+        # - strip CRLF
+        # - ignore empty lines and lines starting with '#'
+        # - strip leading './'
+        # - strip leading '/' (common if generated with find -printf '/%P\n')
+        # - normalize backslashes
+        fd, files_from_path = tempfile.mkstemp(prefix="xfer_include_", suffix=".list")
+        include_from_count = 0
+        with open(include_from_path, "r", encoding="utf-8", errors="replace") as fin, os.fdopen(fd, "w") as fout:
+            for raw in fin:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.lstrip().startswith("#"):
+                    continue
+                while line.startswith("./"):
+                    line = line[2:]
+                while line.startswith("/"):
+                    line = line[1:]
+                line = line.replace("\\", "/")
+                if not line:
+                    continue
+                fout.write(line + "\n")
+                include_from_count += 1
+        if include_from_count <= 0:
+            raise RuntimeError(f"--include-from list is empty after normalization: {include_from_path}")
+        extra_rsync_args.append(f"--files-from={files_from_path}")
+        eprint(f"[dir] include-from: transferring {include_from_count} path(s) listed in {include_from_path}")
+
     if before_date_str or after_date_str:
         try:
             cutoff = datetime.datetime.strptime(
@@ -3526,6 +3563,14 @@ def main() -> int:
         dest="exclude_from",
         default=None,
         help="Path to a file containing rsync exclude patterns (one per line). Passed to rsync as --exclude-from=FILE.",
+    )
+    p.add_argument(
+        "--include-from",
+        dest="include_from",
+        default=None,
+        help="Directory mode ONLY: transfer only the paths listed in this file (one relative path per line). "
+             "Empty lines and lines starting with # are ignored. "
+             "This is implemented via rsync --files-from (paths are relative to the source directory).",
     )
     p.add_argument(
         "--allow-rsync-exit-23",
